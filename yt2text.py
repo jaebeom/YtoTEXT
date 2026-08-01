@@ -16,6 +16,7 @@ v4 추가:
 import os
 import re
 import json
+import subprocess
 import time
 import uuid
 import shutil
@@ -59,6 +60,7 @@ _hist_lock = threading.Lock()
 DL_SEM = threading.Semaphore(3)         # 오디오 다운로드 동시 3개
 TRANSCRIBE_SEM = threading.Semaphore(1)  # 받아쓰기는 한 번에 하나 (CPU 보호)
 CAPTION_SEM = threading.Semaphore(2)    # 자막 요청 동시 2개 (유튜브 차단 예방)
+CHUNK_SEC = 3600                        # 긴 영상은 1시간 단위로 잘라 받아쓰기 (OOM 방지)
 
 # 루프백 바인딩일 때 허용할 Host 헤더 (DNS 리바인딩 방어) — main에서 갱신
 ALLOWED_HOSTS = {"localhost:8765", "127.0.0.1:8765", "[::1]:8765"}
@@ -318,6 +320,17 @@ def _prune_jobs():
             JOBS.pop(jid, None)
 
 
+def _ffprobe_duration(path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30)
+        return float(out.stdout.strip())
+    except Exception:
+        return None
+
+
 def get_model(name: str):
     from faster_whisper import WhisperModel
     import ctranslate2
@@ -373,6 +386,25 @@ def stt_worker(job_id, url, model_name, language):
         video_id = info.get("id") or extract_video_id(url) or "video"
         job["title"] = title  # 큐 행 제목 갱신용
 
+        # 1.5) 긴 영상은 1시간 단위로 분할 — 통짜 디코딩은 수 GB 메모리를 먹어
+        #      OOM으로 프로세스가 죽을 수 있음 (7시간 영상 기준 ~10GB 관측)
+        if duration and duration > CHUNK_SEC * 1.5:
+            job.update(phase="오디오 분할 중 (긴 영상)", progress=23)
+            chunk_dir = tmp / "chunks"
+            chunk_dir.mkdir()
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-nostdin", "-loglevel", "error",
+                     "-i", str(audio), "-f", "segment",
+                     "-segment_time", str(CHUNK_SEC), "-c", "copy",
+                     str(chunk_dir / f"part%04d{audio.suffix}")],
+                    check=True, timeout=600)
+                chunks = sorted(chunk_dir.iterdir())
+            except Exception:  # ffmpeg 없음/실패 시 통짜로라도 진행
+                chunks = [audio]
+        else:
+            chunks = [audio]
+
         # 2) 받아쓰기 (한 번에 하나 — 순번 대기)
         job.update(phase="받아쓰기 순번 대기 중", progress=24)
         with TRANSCRIBE_SEM:
@@ -382,23 +414,28 @@ def stt_worker(job_id, url, model_name, language):
             model = get_model(model_name)
 
             job.update(phase="받아쓰는 중", progress=27)
-            segments, seg_info = model.transcribe(
-                str(audio),
-                language=language or None,
-                vad_filter=True,
-            )
-            items = []
-            for seg in segments:
+            items, offset, lang = [], 0.0, language or None
+            for chunk in chunks:
                 check_cancel()
-                items.append({"text": seg.text, "start": seg.start,
-                              "dur": seg.end - seg.start})
-                if duration:
-                    job["progress"] = 27 + 73 * min(seg.end / duration, 1.0)
-                else:  # 길이를 모르면 진행 지점이라도 표시
-                    job["phase"] = f"받아쓰는 중 · {fmt_ts(seg.end)} 지점"
+                segments, seg_info = model.transcribe(
+                    str(chunk),
+                    language=lang,
+                    vad_filter=True,
+                )
+                for seg in segments:
+                    check_cancel()
+                    items.append({"text": seg.text, "start": seg.start + offset,
+                                  "dur": seg.end - seg.start})
+                    pos = offset + seg.end
+                    if duration:
+                        job["progress"] = 27 + 73 * min(pos / duration, 1.0)
+                    else:  # 길이를 모르면 진행 지점이라도 표시
+                        job["phase"] = f"받아쓰는 중 · {fmt_ts(pos)} 지점"
+                lang = lang or seg_info.language  # 청크 간 언어 통일
+                offset += _ffprobe_duration(chunk) or CHUNK_SEC
 
         res = build_result(video_id, title, items,
-                           seg_info.language, f"whisper:{model_name}")
+                           lang or seg_info.language, f"whisper:{model_name}")
         history_add(res)
         job.update(status="done", progress=100, result=res,
                    ended_at=time.time())
