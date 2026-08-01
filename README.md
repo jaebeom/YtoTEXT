@@ -28,7 +28,7 @@ cd YtoTEXT
 - **뚜껑 닫아도 계속 돌게**: `/etc/systemd/logind.conf`에서 `HandleLidSwitch=ignore`로 바꾸고 재부팅
 - **폰에서 접속**: 노트북과 폰에 [Tailscale](https://tailscale.com) 설치 → `http://<노트북이름>:8765`
 - 코드 업데이트: `git pull && sudo systemctl restart yt2text`
-- NVIDIA GPU가 있으면 자동으로 CUDA 사용 (드라이버 설치 후 `.venv/bin/pip install nvidia-cublas-cu12 nvidia-cudnn-cu12` 필요). 없으면 CPU(int8)로 동작
+- NVIDIA 드라이버가 잡혀 있으면 `install.sh`가 CUDA 라이브러리(cuBLAS/cuDNN)까지 자동 설치하고 GPU로 받아씁니다. 없으면 CPU(int8)로 동작. 드라이버는 `sudo ubuntu-drivers install` 후 재부팅하고 `./install.sh` 재실행
 
 ## 기능
 

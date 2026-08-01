@@ -20,6 +20,24 @@ python3 -m venv "$DIR/.venv"
 "$DIR/.venv/bin/pip" install -q -U pip
 "$DIR/.venv/bin/pip" install -q -r "$DIR/requirements.txt"
 
+# NVIDIA GPU가 있으면 Whisper GPU 가속용 라이브러리 설치 (cuBLAS/cuDNN)
+GPU_ENV=""
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+  echo "==> NVIDIA GPU 감지 — CUDA 라이브러리 설치 (1~2GB, 시간 좀 걸려요)"
+  "$DIR/.venv/bin/pip" install -q nvidia-cublas-cu12 nvidia-cudnn-cu12
+  CUDA_LIBS="$("$DIR/.venv/bin/python" - <<'PY'
+import os
+try:
+    import nvidia.cublas.lib, nvidia.cudnn.lib
+    print(os.path.dirname(nvidia.cublas.lib.__file__) + ":"
+          + os.path.dirname(nvidia.cudnn.lib.__file__))
+except Exception:
+    pass
+PY
+)"
+  [ -n "$CUDA_LIBS" ] && GPU_ENV="Environment=LD_LIBRARY_PATH=$CUDA_LIBS"
+fi
+
 echo "==> systemd 서비스 등록 (부팅 시 자동 시작)"
 sudo tee /etc/systemd/system/yt2text.service >/dev/null <<EOF
 [Unit]
@@ -34,12 +52,14 @@ WorkingDirectory=$DIR
 ExecStart=$DIR/.venv/bin/python $DIR/yt2text.py --host $HOST --port $PORT
 Restart=on-failure
 RestartSec=3
+$GPU_ENV
 
 [Install]
 WantedBy=multi-user.target
 EOF
 sudo systemctl daemon-reload
-sudo systemctl enable --now yt2text
+sudo systemctl enable yt2text
+sudo systemctl restart yt2text
 
 echo
 echo "  설치 완료!  →  http://localhost:$PORT"
