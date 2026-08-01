@@ -376,14 +376,26 @@ def _preload_cuda_libs():
         pass
 
 
-def get_model(name: str):
+_force_cpu = False  # GPU가 한 번이라도 깨지면 켜짐 — 이후 작업은 CPU로
+
+
+def _is_cuda_error(e) -> bool:
+    s = str(e).lower()
+    return any(k in s for k in ("cublas", "cudnn", "cuda"))
+
+
+def get_model(name: str, force_cpu=False):
+    global _force_cpu
     from faster_whisper import WhisperModel
     import ctranslate2
     with _model_lock:
+        if force_cpu and not _force_cpu:
+            _force_cpu = True
+            _model_cache.clear()  # GPU 모델 버리고 CPU로 다시
         if name in _model_cache:
             return _model_cache[name]
         _model_cache.clear()
-        if ctranslate2.get_cuda_device_count() > 0:
+        if not _force_cpu and ctranslate2.get_cuda_device_count() > 0:
             _preload_cuda_libs()
             device, compute = "cuda", "float16"
         else:
@@ -393,7 +405,8 @@ def get_model(name: str):
         except Exception:
             if device != "cuda":
                 raise
-            device, compute = "cpu", "int8"  # GPU 로드 실패 → CPU로라도 진행
+            _force_cpu = True  # GPU 로드 실패 → CPU로라도 진행
+            device, compute = "cpu", "int8"
             model = WhisperModel(name, device=device, compute_type=compute)
         _model_cache[name] = model
         return model
@@ -469,20 +482,36 @@ def stt_worker(job_id, url, model_name, language):
             items, offset, lang = [], 0.0, language or None
             for chunk in chunks:
                 check_cancel()
-                segments, seg_info = model.transcribe(
-                    str(chunk),
-                    language=lang,
-                    vad_filter=True,
-                )
-                for seg in segments:
-                    check_cancel()
-                    items.append({"text": seg.text, "start": seg.start + offset,
-                                  "dur": seg.end - seg.start})
-                    pos = offset + seg.end
-                    if duration:
-                        job["progress"] = 27 + 73 * min(pos / duration, 1.0)
-                    else:  # 길이를 모르면 진행 지점이라도 표시
-                        job["phase"] = f"받아쓰는 중 · {fmt_ts(pos)} 지점"
+                for attempt in (1, 2):
+                    mark = len(items)
+                    try:
+                        segments, seg_info = model.transcribe(
+                            str(chunk),
+                            language=lang,
+                            vad_filter=True,
+                        )
+                        for seg in segments:
+                            check_cancel()
+                            items.append({"text": seg.text,
+                                          "start": seg.start + offset,
+                                          "dur": seg.end - seg.start})
+                            pos = offset + seg.end
+                            if duration:
+                                job["progress"] = 27 + 73 * min(pos / duration, 1.0)
+                            else:  # 길이를 모르면 진행 지점이라도 표시
+                                job["phase"] = f"받아쓰는 중 · {fmt_ts(pos)} 지점"
+                        break
+                    except JobCancelled:
+                        raise
+                    except RuntimeError as e:
+                        # GPU 라이브러리 문제는 받아쓰기 도중에도 터질 수 있음
+                        # → 이 청크를 CPU 모델로 다시 시도하고 이후로도 CPU 유지
+                        del items[mark:]
+                        if attempt == 1 and _is_cuda_error(e):
+                            job.update(phase="GPU 오류 — CPU로 전환해서 계속함")
+                            model = get_model(model_name, force_cpu=True)
+                        else:
+                            raise
                 lang = lang or seg_info.language  # 청크 간 언어 통일
                 offset += _ffprobe_duration(chunk) or CHUNK_SEC
 
