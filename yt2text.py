@@ -15,6 +15,7 @@ v4 추가:
 
 import os
 import re
+import glob
 import json
 import random
 import subprocess
@@ -357,6 +358,24 @@ def _ffprobe_duration(path):
         return None
 
 
+def _preload_cuda_libs():
+    """pip으로 설치한 cuBLAS/cuDNN을 LD_LIBRARY_PATH 설정 없이도 쓸 수 있게
+    미리 로드 (환경변수 누락으로 'libcublas.so.12 not found'가 나는 문제 방지)."""
+    try:
+        import ctypes
+        import nvidia.cublas.lib
+        import nvidia.cudnn.lib
+        for d in (os.path.dirname(nvidia.cublas.lib.__file__),
+                  os.path.dirname(nvidia.cudnn.lib.__file__)):
+            for so in sorted(glob.glob(os.path.join(d, "*.so*"))):
+                try:
+                    ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
 def get_model(name: str):
     from faster_whisper import WhisperModel
     import ctranslate2
@@ -365,10 +384,17 @@ def get_model(name: str):
             return _model_cache[name]
         _model_cache.clear()
         if ctranslate2.get_cuda_device_count() > 0:
+            _preload_cuda_libs()
             device, compute = "cuda", "float16"
         else:
             device, compute = "cpu", "int8"
-        model = WhisperModel(name, device=device, compute_type=compute)
+        try:
+            model = WhisperModel(name, device=device, compute_type=compute)
+        except Exception:
+            if device != "cuda":
+                raise
+            device, compute = "cpu", "int8"  # GPU 로드 실패 → CPU로라도 진행
+            model = WhisperModel(name, device=device, compute_type=compute)
         _model_cache[name] = model
         return model
 
@@ -683,6 +709,8 @@ PAGE = r"""<!doctype html>
       </select>
     </div>
     <div class="err" id="err"></div>
+    <button class="qbtn" id="stopall" style="display:none"
+      onclick="stopAllRetries()">차단 재시도 전체 중지</button>
 
     <div class="queue" id="queue"></div>
 
@@ -838,14 +866,37 @@ function startRow(vid){
 
 // ------------------------------------------------ 자막 루트 (행 단위)
 function retryLater(vid, sec, attempt, fn){
+  const r = ROWS[vid];
   let left = sec;
   const tick = ()=>rowStat(vid,
     `유튜브 차단 감지 — ${left}초 후 자동 재시도 (${attempt}/5)`);
   tick();
-  const iv = setInterval(()=>{
+  const acts = r.el.querySelector('.qacts');
+  acts.innerHTML = '';
+  acts.appendChild(btn('중지', '', ()=>stopRetry(vid)));
+  r.retryTimer = setInterval(()=>{
     if(--left > 0) return tick();
-    clearInterval(iv); fn();
+    clearInterval(r.retryTimer); r.retryTimer = null;
+    updateStopAll();
+    fn();
   }, 1000);
+  updateStopAll();
+}
+
+function stopRetry(vid){
+  const r = ROWS[vid];
+  if(r.retryTimer){ clearInterval(r.retryTimer); r.retryTimer = null; }
+  rowFail(vid, '중지됨 — 나중에 다시 추출하세요');
+  updateStopAll();
+}
+
+function stopAllRetries(){
+  for(const vid in ROWS) if(ROWS[vid].retryTimer) stopRetry(vid);
+}
+
+function updateStopAll(){
+  const any = Object.values(ROWS).some(r => r.retryTimer);
+  $('stopall').style.display = any ? 'inline-block' : 'none';
 }
 
 async function runCaption(vid, lang, attempt){
