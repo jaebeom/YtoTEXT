@@ -13,6 +13,7 @@ v4 추가:
       (자막: 병렬 / Whisper: 다운로드 3개 병렬 + 받아쓰기는 순차 큐)
 """
 
+import os
 import re
 import json
 import time
@@ -38,6 +39,13 @@ from youtube_transcript_api import (
 
 app = Flask(__name__)
 
+
+@app.before_request
+def _check_host():
+    # 외부 사이트가 DNS 리바인딩으로 로컬 서버를 조작하는 것 방지
+    if ALLOWED_HOSTS and request.host not in ALLOWED_HOSTS:
+        return jsonify(error="허용되지 않은 요청이에요."), 403
+
 PREFERRED = ["ko", "en"]
 HISTORY_MAX = 300
 BATCH_MAX = 10
@@ -45,10 +53,15 @@ BATCH_MAX = 10
 DATA_DIR = Path(__file__).resolve().parent / "yt2text_data"
 HISTORY_FILE = DATA_DIR / "history.json"
 THUMBS_DIR = DATA_DIR / "thumbs"
+RESULTS_DIR = DATA_DIR / "results"
 _hist_lock = threading.Lock()
 
 DL_SEM = threading.Semaphore(3)         # 오디오 다운로드 동시 3개
 TRANSCRIBE_SEM = threading.Semaphore(1)  # 받아쓰기는 한 번에 하나 (CPU 보호)
+CAPTION_SEM = threading.Semaphore(2)    # 자막 요청 동시 2개 (유튜브 차단 예방)
+
+# 루프백 바인딩일 때 허용할 Host 헤더 (DNS 리바인딩 방어) — main에서 갱신
+ALLOWED_HOSTS = {"localhost:8765", "127.0.0.1:8765", "[::1]:8765"}
 
 VIDEO_ID_RE = re.compile(
     r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|live/|embed/)|^)"
@@ -125,10 +138,44 @@ def _load_history():
         return []
 
 
+def _atomic_write(path: Path, text: str):
+    """쓰다가 죽어도 원본이 깨지지 않게 임시 파일에 쓴 뒤 교체."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _save_history(entries):
-    DATA_DIR.mkdir(exist_ok=True)
-    HISTORY_FILE.write_text(
-        json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+    _atomic_write(HISTORY_FILE, json.dumps(entries, ensure_ascii=False))
+
+
+def _result_path(key: str) -> Path:
+    """항목 키 → 전문 파일 경로 (윈도우 금지 문자 ':'와 경로 탈출 제거)."""
+    fname = key.replace(":", "__").replace("/", "_").replace("\\", "_")
+    return RESULTS_DIR / f"{fname}.json"
+
+
+def _migrate_history():
+    """구버전(전문이 history.json에 통째로) → 항목별 결과 파일로 분리."""
+    with _hist_lock:
+        entries = _load_history()
+        if not any("result" in e for e in entries):
+            return
+        for e in entries:
+            res = e.pop("result", None)
+            if res is not None and not _result_path(e["key"]).exists():
+                _atomic_write(_result_path(e["key"]),
+                              json.dumps(res, ensure_ascii=False))
+        _save_history(entries)
 
 
 def save_thumb(video_id: str):
@@ -156,11 +203,13 @@ def history_add(result):
         "language": result.get("language"),
         "duration": result.get("duration"),
         "saved_at": time.strftime("%Y-%m-%d %H:%M"),
-        "result": result,
     }
     with _hist_lock:
+        _atomic_write(_result_path(key), json.dumps(result, ensure_ascii=False))
         entries = [e for e in _load_history() if e.get("key") != key]
         entries.insert(0, entry)
+        for old in entries[HISTORY_MAX:]:  # 밀려난 항목은 전문 파일도 정리
+            _result_path(old["key"]).unlink(missing_ok=True)
         _save_history(entries[:HISTORY_MAX])
     threading.Thread(target=save_thumb,
                      args=(result["video_id"],), daemon=True).start()
@@ -176,10 +225,10 @@ def api_history():
 
 @app.get("/api/history/<path:key>")
 def api_history_get(key):
-    with _hist_lock:
-        for e in _load_history():
-            if e.get("key") == key:
-                return jsonify(e["result"])
+    p = _result_path(key)
+    if p.exists():
+        return Response(p.read_text(encoding="utf-8"),
+                        mimetype="application/json")
     return jsonify(error="히스토리에 없어요."), 404
 
 
@@ -198,13 +247,19 @@ def api_history_delete(key):
     with _hist_lock:
         entries = [e for e in _load_history() if e.get("key") != key]
         _save_history(entries)
+        _result_path(key).unlink(missing_ok=True)
     return jsonify(ok=True)
+
+
+_migrate_history()
 
 # ---------------------------------------------------------------- 자막 루트
 
 @app.post("/api/transcript")
 def api_transcript():
-    data = request.get_json(force=True)
+    data = request.get_json(silent=True)  # JSON 강제 (타 사이트 text/plain 방어)
+    if not isinstance(data, dict):
+        return jsonify(error="JSON 요청이 필요해요."), 400
     url, lang = data.get("url", ""), data.get("lang")
 
     video_id = extract_video_id(url)
@@ -212,16 +267,17 @@ def api_transcript():
         return jsonify(error="유튜브 링크를 인식하지 못했어요."), 400
 
     try:
-        yt = YouTubeTranscriptApi()  # 요청마다 새로 (배치 병렬 안전)
-        tlist = yt.list(video_id)
-        available = [{"code": t.language_code, "name": t.language,
-                      "generated": t.is_generated} for t in tlist]
-        if lang:
-            transcript = tlist.find_transcript([lang])
-        else:
-            transcript = tlist.find_transcript(
-                PREFERRED + [a["code"] for a in available])
-        fetched = transcript.fetch()
+        with CAPTION_SEM:  # 배치 시 동시 요청 제한 (IP 차단 예방)
+            yt = YouTubeTranscriptApi()  # 요청마다 새로 (배치 병렬 안전)
+            tlist = yt.list(video_id)
+            available = [{"code": t.language_code, "name": t.language,
+                          "generated": t.is_generated} for t in tlist]
+            if lang:
+                transcript = tlist.find_transcript([lang])
+            else:
+                transcript = tlist.find_transcript(
+                    PREFERRED + [a["code"] for a in available])
+            fetched = transcript.fetch()
 
     except (TranscriptsDisabled, NoTranscriptFound):
         return jsonify(error="자막이 없는 영상이에요.", no_captions=True), 404
@@ -245,8 +301,21 @@ def api_transcript():
 # ---------------------------------------------------------------- STT 루트
 
 JOBS = {}
+JOB_TTL = 600  # 끝난 작업은 10분 뒤 메모리에서 제거
 _model_lock = threading.Lock()
 _model_cache = {}
+
+
+class JobCancelled(Exception):
+    pass
+
+
+def _prune_jobs():
+    now = time.time()
+    for jid in list(JOBS):
+        j = JOBS[jid]
+        if j.get("status") != "running" and now - j.get("ended_at", now) > JOB_TTL:
+            JOBS.pop(jid, None)
 
 
 def get_model(name: str):
@@ -268,14 +337,21 @@ def get_model(name: str):
 def stt_worker(job_id, url, model_name, language):
     job = JOBS[job_id]
     tmp = Path(tempfile.mkdtemp(prefix="yt2text_"))
+
+    def check_cancel():
+        if job.get("cancel"):
+            raise JobCancelled()
+
     try:
         # 1) 오디오 다운로드 (동시 3개 제한)
         job.update(phase="다운로드 대기", progress=1)
         with DL_SEM:
+            check_cancel()
             job.update(phase="오디오 다운로드 중", progress=2)
             import yt_dlp
 
             def hook(d):
+                check_cancel()  # 예외를 던져 다운로드 자체를 중단
                 if d.get("status") == "downloading":
                     total = d.get("total_bytes") or d.get("total_bytes_estimate")
                     if total:
@@ -290,6 +366,7 @@ def stt_worker(job_id, url, model_name, language):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
 
+        check_cancel()
         audio = next(p for p in tmp.iterdir() if p.is_file())
         title = info.get("title")
         duration = info.get("duration") or 0
@@ -299,6 +376,7 @@ def stt_worker(job_id, url, model_name, language):
         # 2) 받아쓰기 (한 번에 하나 — 순번 대기)
         job.update(phase="받아쓰기 순번 대기 중", progress=24)
         with TRANSCRIBE_SEM:
+            check_cancel()
             job.update(phase="모델 로딩 중 (최초 1회는 다운로드, 수 분 걸릴 수 있음)",
                        progress=25)
             model = get_model(model_name)
@@ -311,25 +389,38 @@ def stt_worker(job_id, url, model_name, language):
             )
             items = []
             for seg in segments:
+                check_cancel()
                 items.append({"text": seg.text, "start": seg.start,
                               "dur": seg.end - seg.start})
                 if duration:
                     job["progress"] = 27 + 73 * min(seg.end / duration, 1.0)
+                else:  # 길이를 모르면 진행 지점이라도 표시
+                    job["phase"] = f"받아쓰는 중 · {fmt_ts(seg.end)} 지점"
 
         res = build_result(video_id, title, items,
                            seg_info.language, f"whisper:{model_name}")
         history_add(res)
-        job.update(status="done", progress=100, result=res)
+        job.update(status="done", progress=100, result=res,
+                   ended_at=time.time())
 
+    except JobCancelled:
+        job.update(status="cancelled", phase="취소됨", ended_at=time.time())
     except Exception as e:
-        job.update(status="error", error=f"{type(e).__name__}: {e}")
+        if job.get("cancel"):  # yt-dlp가 훅에서 난 예외를 감싸서 올리는 경우
+            job.update(status="cancelled", phase="취소됨", ended_at=time.time())
+        else:
+            job.update(status="error", error=f"{type(e).__name__}: {e}",
+                       ended_at=time.time())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 @app.post("/api/stt")
 def api_stt():
-    data = request.get_json(force=True)
+    _prune_jobs()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="JSON 요청이 필요해요."), 400
     url = data.get("url", "")
     model_name = data.get("model", "large-v3-turbo")
     language = data.get("language") or None
@@ -347,16 +438,28 @@ def api_stt():
 
 @app.get("/api/stt/status")
 def api_stt_status():
+    _prune_jobs()
     job = JOBS.get(request.args.get("id", ""))
     if not job:
         return jsonify(error="작업을 찾을 수 없어요."), 404
     return jsonify(job)
 
+
+@app.post("/api/stt/cancel")
+def api_stt_cancel():
+    data = request.get_json(silent=True) or {}
+    job = JOBS.get(data.get("id", ""))
+    if not job:
+        return jsonify(error="작업을 찾을 수 없어요."), 404
+    job["cancel"] = True
+    return jsonify(ok=True)
+
 # ---------------------------------------------------------------- 페이지
 
 @app.get("/")
 def index():
-    return Response(PAGE, mimetype="text/html")
+    return Response(PAGE.replace("__BATCH_MAX__", str(BATCH_MAX)),
+                    mimetype="text/html")
 
 
 PAGE = r"""<!doctype html>
@@ -496,7 +599,7 @@ PAGE = r"""<!doctype html>
         onkeydown="if(event.key==='Enter'&&(event.metaKey||event.ctrlKey)){event.preventDefault();go();}"></textarea>
       <button class="btn" id="gobtn" onclick="go()">추출</button>
     </div>
-    <div class="hint">여러 개는 줄바꿈으로 구분 (최대 10개) · ⌘/Ctrl+Enter로 추출</div>
+    <div class="hint">여러 개는 줄바꿈으로 구분 (최대 __BATCH_MAX__개) · ⌘/Ctrl+Enter로 추출</div>
 
     <div class="wopts" id="wopts">
       <select id="model">
@@ -542,6 +645,7 @@ PAGE = r"""<!doctype html>
 let D = null, HIST = [], ROWS = {}, POLL = null;
 const $ = id => document.getElementById(id);
 const IDRE = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|live\/|embed\/)|^)([A-Za-z0-9_-]{11})/;
+const BATCH_MAX = __BATCH_MAX__;
 
 function growBox(el){
   el.style.height = 'auto';
@@ -570,16 +674,19 @@ function go(){
     else if(!m) bad.push(line);
   }
   if(bad.length) $('err').textContent = `인식 실패 ${bad.length}건은 건너뛰어요.`;
-  if(ids.length > 10){
-    $('err').textContent += ` 10개까지만 — 앞의 10개를 처리해요.`;
-    ids.length = 10;
+  if(ids.length > BATCH_MAX){
+    $('err').textContent += ` ${BATCH_MAX}개까지만 — 앞의 ${BATCH_MAX}개를 처리해요.`;
+    ids.length = BATCH_MAX;
   }
   if(!ids.length) return;
 
-  $('queue').innerHTML = ''; ROWS = {};
+  // 돌고 있는 작업이 있으면 큐를 리셋하지 않고 뒤에 이어붙임
+  const running = Object.values(ROWS).some(r => r.busy);
+  if(!running){ $('queue').innerHTML = ''; ROWS = {}; }
   $('queue').classList.add('show');
 
   for(const vid of ids){
+    if(ROWS[vid]) continue;  // 이미 큐에 있는 영상
     const prev = HIST.find(h => h.video_id === vid);  // 중복 감지
     makeRow(vid, prev);
     if(!prev) startRow(vid);
@@ -618,7 +725,7 @@ function makeRow(vid, prev){
   }
 
   $('queue').appendChild(row);
-  ROWS[vid] = {el: row, result: null};
+  ROWS[vid] = {el: row, result: null, busy: false};
 }
 
 function btn(label, cls, fn){
@@ -637,8 +744,10 @@ function rowBar(vid, pct){
 function rowDone(vid, result){
   const r = ROWS[vid];
   r.result = result;
+  r.busy = false;
   r.el.classList.add('done');
   r.el.querySelector('.qbar').classList.remove('show');
+  r.el.querySelector('.qacts').innerHTML = '';
   rowTitle(vid, result.title);
   rowStat(vid, '완료 · 클릭해서 열기');
   r.el.onclick = ()=>{ D = result; show(); };
@@ -647,8 +756,11 @@ function rowDone(vid, result){
   if(Object.keys(ROWS).length === 1){ D = result; show(); }
 }
 function rowFail(vid, msg){
-  ROWS[vid].el.classList.add('fail');
-  ROWS[vid].el.querySelector('.qbar').classList.remove('show');
+  const r = ROWS[vid];
+  r.busy = false;
+  r.el.classList.add('fail');
+  r.el.querySelector('.qbar').classList.remove('show');
+  r.el.querySelector('.qacts').innerHTML = '';
   rowStat(vid, msg);
 }
 
@@ -658,6 +770,7 @@ function startRow(vid){
 
 // ------------------------------------------------ 자막 루트 (행 단위)
 async function runCaption(vid, lang){
+  ROWS[vid].busy = true;
   rowStat(vid, '자막 추출 중...');
   try{
     const r = await fetch('/api/transcript', {
@@ -687,6 +800,7 @@ async function runCaption(vid, lang){
 
 // ------------------------------------------------ STT 루트 (행 단위)
 async function runStt(vid){
+  ROWS[vid].busy = true;
   rowStat(vid, '작업 등록 중...');
   try{
     const r = await fetch('/api/stt', {
@@ -700,8 +814,23 @@ async function runStt(vid){
     const j = await r.json();
     if(!r.ok){ rowFail(vid, j.error); return; }
     ROWS[vid].jobId = j.job_id;
+    const acts = ROWS[vid].el.querySelector('.qacts');
+    acts.innerHTML = '';
+    acts.appendChild(btn('취소', '', ()=>cancelStt(vid)));
     ensurePolling();
   }catch(e){ rowFail(vid, '서버 연결 실패'); }
+}
+
+async function cancelStt(vid){
+  const id = ROWS[vid].jobId;
+  if(!id) return;
+  rowStat(vid, '취소하는 중...');
+  try{
+    await fetch('/api/stt/cancel', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id})
+    });
+  }catch(e){}
 }
 
 function ensurePolling(){
@@ -715,12 +844,19 @@ function ensurePolling(){
       try{
         const r = await fetch('/api/stt/status?id=' + row.jobId);
         const j = await r.json();
+        if(!r.ok){  // 서버 재시작 등으로 작업이 사라진 경우
+          row.jobId = null;
+          rowFail(vid, j.error || '작업 정보를 잃어버렸어요 (서버 재시작?)');
+          continue;
+        }
         if(j.title) rowTitle(vid, j.title);
         if(j.status === 'running'){
           rowStat(vid, j.phase || '');
           rowBar(vid, j.progress || 0);
         }else if(j.status === 'done'){
           row.jobId = null; rowDone(vid, j.result);
+        }else if(j.status === 'cancelled'){
+          row.jobId = null; rowFail(vid, '취소됨');
         }else if(j.status === 'error'){
           row.jobId = null; rowFail(vid, j.error);
         }
@@ -870,5 +1006,18 @@ loadHistory();
 """
 
 if __name__ == "__main__":
-    print("\n  yt2text →  http://localhost:8765\n")
-    app.run(host="127.0.0.1", port=8765, debug=False, threaded=True)
+    import argparse
+    ap = argparse.ArgumentParser(description="yt2text — 유튜브 → 텍스트")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8765)
+    args = ap.parse_args()
+
+    if args.host in ("127.0.0.1", "localhost", "::1"):
+        ALLOWED_HOSTS = {f"localhost:{args.port}", f"127.0.0.1:{args.port}",
+                         f"[::1]:{args.port}"}
+    else:  # 외부 바인딩은 사용자가 의도한 것 — Host 검사 생략
+        ALLOWED_HOSTS = set()
+
+    shown = "localhost" if args.host in ("127.0.0.1", "localhost", "::1") else args.host
+    print(f"\n  yt2text →  http://{shown}:{args.port}\n")
+    app.run(host=args.host, port=args.port, debug=False, threaded=True)
