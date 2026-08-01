@@ -16,6 +16,7 @@ v4 추가:
 import os
 import re
 import json
+import random
 import subprocess
 import time
 import uuid
@@ -49,7 +50,7 @@ def _check_host():
 
 PREFERRED = ["ko", "en"]
 HISTORY_MAX = 300
-BATCH_MAX = 10
+BATCH_MAX = 50
 
 DATA_DIR = Path(__file__).resolve().parent / "yt2text_data"
 HISTORY_FILE = DATA_DIR / "history.json"
@@ -59,8 +60,13 @@ _hist_lock = threading.Lock()
 
 DL_SEM = threading.Semaphore(3)         # 오디오 다운로드 동시 3개
 TRANSCRIBE_SEM = threading.Semaphore(1)  # 받아쓰기는 한 번에 하나 (CPU 보호)
-CAPTION_SEM = threading.Semaphore(2)    # 자막 요청 동시 2개 (유튜브 차단 예방)
+CAPTION_SEM = threading.Semaphore(1)    # 자막 요청은 한 번에 하나 (봇 감지 회피)
 CHUNK_SEC = 3600                        # 긴 영상은 1시간 단위로 잘라 받아쓰기 (OOM 방지)
+
+# 자막 요청 페이싱: 요청 사이 랜덤 간격 + 차단 시 전체 쿨다운(지수 백오프)
+_last_caption = 0.0
+_cooldown_until = 0.0
+_cooldown_len = 90  # 차단 시 첫 쿨다운(초). 반복되면 2배씩, 최대 15분
 
 # 루프백 바인딩일 때 허용할 Host 헤더 (DNS 리바인딩 방어) — main에서 갱신
 ALLOWED_HOSTS = {"localhost:8765", "127.0.0.1:8765", "[::1]:8765"}
@@ -125,6 +131,7 @@ def build_result(video_id, title, items, language, source):
         paragraphs=to_paragraphs(items),
         lines=[{
             "t": fmt_ts(it["start"]),
+            "s": int(it["start"]),
             "srt_a": fmt_ts(it["start"], srt=True),
             "srt_b": fmt_ts(it["start"] + (it["dur"] or 0), srt=True),
             "text": it["text"].replace("\n", " ").strip(),
@@ -259,6 +266,7 @@ _migrate_history()
 
 @app.post("/api/transcript")
 def api_transcript():
+    global _last_caption, _cooldown_until, _cooldown_len
     data = request.get_json(silent=True)  # JSON 강제 (타 사이트 text/plain 방어)
     if not isinstance(data, dict):
         return jsonify(error="JSON 요청이 필요해요."), 400
@@ -268,9 +276,21 @@ def api_transcript():
     if not video_id:
         return jsonify(error="유튜브 링크를 인식하지 못했어요."), 400
 
+    now = time.time()
+    if _cooldown_until > now:  # 차단 쿨다운 중 — 클라이언트가 대기 후 자동 재시도
+        return jsonify(error="유튜브 차단 쿨다운 중이에요.",
+                       retry_after=int(_cooldown_until - now) + 1), 429
+
     try:
-        with CAPTION_SEM:  # 배치 시 동시 요청 제한 (IP 차단 예방)
-            yt = YouTubeTranscriptApi()  # 요청마다 새로 (배치 병렬 안전)
+        with CAPTION_SEM:  # 한 번에 하나씩만
+            # 사람처럼 보이게: 연속 요청 사이 랜덤 간격
+            gap = random.uniform(2.0, 5.0)
+            since = time.time() - _last_caption
+            if since < gap:
+                time.sleep(gap - since)
+            _last_caption = time.time()
+
+            yt = YouTubeTranscriptApi()  # 요청마다 새로 (스레드 안전)
             tlist = yt.list(video_id)
             available = [{"code": t.language_code, "name": t.language,
                           "generated": t.is_generated} for t in tlist]
@@ -280,13 +300,19 @@ def api_transcript():
                 transcript = tlist.find_transcript(
                     PREFERRED + [a["code"] for a in available])
             fetched = transcript.fetch()
+            _cooldown_len = 90  # 성공 → 쿨다운 길이 리셋
 
     except (TranscriptsDisabled, NoTranscriptFound):
         return jsonify(error="자막이 없는 영상이에요.", no_captions=True), 404
     except (VideoUnavailable, AgeRestricted):
         return jsonify(error="영상에 접근할 수 없어요 (비공개/삭제/연령 제한)."), 404
     except (IpBlocked, RequestBlocked):
-        return jsonify(error="유튜브가 요청을 차단했어요. 잠시 후 다시 시도해 보세요."), 429
+        # 전체 자막 요청을 잠시 멈춤 — 차단 상태에서 계속 두드리면 더 길어짐
+        _cooldown_until = time.time() + _cooldown_len
+        retry = int(_cooldown_len)
+        _cooldown_len = min(_cooldown_len * 2, 900)
+        return jsonify(error="유튜브가 요청을 차단했어요 — 쉬었다가 자동 재시도해요.",
+                       retry_after=retry), 429
     except Exception as e:
         return jsonify(error=f"오류: {type(e).__name__}"), 500
 
@@ -582,6 +608,9 @@ PAGE = r"""<!doctype html>
   .chip.lang{cursor:pointer;border:1px solid transparent}
   .chip.lang:hover{border-color:var(--ink-soft)}
   .chip.lang.on{background:var(--ink);color:#fff}
+  .chip.ylink{color:var(--accent);border:1px solid var(--accent);background:none;
+       text-decoration:none;font-weight:600}
+  .chip.ylink:hover{background:var(--accent);color:#fff}
   .tools{display:flex;gap:14px;padding:12px 34px;border-bottom:1px solid var(--line);
        align-items:center;flex-wrap:wrap}
   .tools label{font-size:13px;color:var(--ink-soft);display:flex;gap:6px;align-items:center;cursor:pointer}
@@ -593,6 +622,8 @@ PAGE = r"""<!doctype html>
   .body{padding:30px 34px 40px;max-height:62vh;overflow-y:auto}
   .body p{font-size:15.5px;line-height:1.85;color:var(--ink);margin-bottom:1.2em;word-break:keep-all}
   .body .ts{font-family:var(--mono);font-size:12px;color:var(--accent);margin-right:10px;flex-shrink:0}
+  .body a.ts{text-decoration:none}
+  .body a.ts:hover{text-decoration:underline}
   .body .row{display:flex;margin-bottom:.5em}
   .body .row span:last-child{font-size:15px;line-height:1.7;color:var(--ink)}
 
@@ -806,7 +837,19 @@ function startRow(vid){
 }
 
 // ------------------------------------------------ 자막 루트 (행 단위)
-async function runCaption(vid, lang){
+function retryLater(vid, sec, attempt, fn){
+  let left = sec;
+  const tick = ()=>rowStat(vid,
+    `유튜브 차단 감지 — ${left}초 후 자동 재시도 (${attempt}/5)`);
+  tick();
+  const iv = setInterval(()=>{
+    if(--left > 0) return tick();
+    clearInterval(iv); fn();
+  }, 1000);
+}
+
+async function runCaption(vid, lang, attempt){
+  attempt = attempt || 0;
   ROWS[vid].busy = true;
   rowStat(vid, '자막 추출 중...');
   try{
@@ -816,6 +859,12 @@ async function runCaption(vid, lang){
     });
     const j = await r.json();
     if(!r.ok){
+      // 차단(429)이면 서버가 알려준 쿨다운만큼 쉬었다가 자동 재시도
+      if(r.status === 429 && attempt < 5){
+        const wait = (j.retry_after || 60) + Math.floor(Math.random()*15);
+        retryLater(vid, wait, attempt+1, ()=>runCaption(vid, lang, attempt+1));
+        return;
+      }
       rowFail(vid, j.no_captions
         ? '자막 없음 — Whisper 모드로 다시 추출하세요'
         : (j.error || '오류'));
@@ -959,6 +1008,7 @@ function show(){
   $('title').textContent = D.title || ('영상 ' + D.video_id);
   const meta = $('meta');
   meta.innerHTML = '';
+  meta.appendChild(linkChip('YouTube ↗', 'https://youtu.be/' + D.video_id));
   meta.appendChild(chip(D.duration));
   if(D.source === 'caption'){
     meta.appendChild(chip(D.is_generated ? '자동 생성 자막' : '업로더 자막'));
@@ -989,13 +1039,28 @@ function chip(text, extra){
   return s;
 }
 
+function linkChip(text, href){
+  const a = document.createElement('a');
+  a.className = 'chip ylink'; a.textContent = text;
+  a.href = href; a.target = '_blank'; a.rel = 'noopener';
+  return a;
+}
+
+function tsSec(l){  // 구버전 히스토리엔 s(초)가 없으니 "H:MM:SS"에서 계산
+  if(l.s != null) return l.s;
+  return l.t.split(':').map(Number).reduce((a,b)=>a*60+b, 0);
+}
+
 function render(){
   const out = $('out');
   out.innerHTML = '';
   if($('tsbox').checked){
     D.lines.forEach(l=>{
       const d = document.createElement('div'); d.className='row';
-      const t = document.createElement('span'); t.className='ts'; t.textContent = l.t;
+      const t = document.createElement('a'); t.className='ts'; t.textContent = l.t;
+      t.href = 'https://youtu.be/' + D.video_id + '?t=' + tsSec(l);
+      t.target = '_blank'; t.rel = 'noopener';
+      t.title = '유튜브에서 이 지점 열기';
       const x = document.createElement('span'); x.textContent = l.text;
       d.append(t,x); out.appendChild(d);
     });
