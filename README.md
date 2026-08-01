@@ -14,6 +14,22 @@ python yt2text.py
 
 브라우저에서 → http://localhost:8765
 
+## 우분투 노트북을 홈서버로 쓰기
+
+```bash
+git clone https://github.com/jaebeom/YtoTEXT.git
+cd YtoTEXT
+./install.sh    # venv + ffmpeg + systemd 서비스 등록까지 한 번에
+```
+
+- 기본으로 `0.0.0.0:8765`에 바인딩됩니다 — 같은 네트워크/Tailscale에서 접속 가능.
+  이 컴퓨터에서만 쓰려면 `HOST=127.0.0.1 ./install.sh`
+- 서비스 관리: `systemctl status|restart|stop yt2text` · 로그: `journalctl -u yt2text -f`
+- **뚜껑 닫아도 계속 돌게**: `/etc/systemd/logind.conf`에서 `HandleLidSwitch=ignore`로 바꾸고 재부팅
+- **폰에서 접속**: 노트북과 폰에 [Tailscale](https://tailscale.com) 설치 → `http://<노트북이름>:8765`
+- 코드 업데이트: `git pull && sudo systemctl restart yt2text`
+- NVIDIA GPU가 있으면 자동으로 CUDA 사용 (드라이버 설치 후 `.venv/bin/pip install nvidia-cublas-cu12 nvidia-cudnn-cu12` 필요). 없으면 CPU(int8)로 동작
+
 ## 기능
 
 - **자막 모드 (빠름)** — `youtube-transcript-api`로 업로더/자동생성 자막을 바로 가져옴.
