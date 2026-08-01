@@ -26,13 +26,10 @@ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
   echo "==> NVIDIA GPU 감지 — CUDA 라이브러리 설치 (1~2GB, 시간 좀 걸려요)"
   if "$DIR/.venv/bin/pip" install -q nvidia-cublas-cu12 nvidia-cudnn-cu12; then
     CUDA_LIBS="$("$DIR/.venv/bin/python" - <<'PY'
-import os
-try:
-    import nvidia.cublas.lib, nvidia.cudnn.lib
-    print(os.path.dirname(nvidia.cublas.lib.__file__) + ":"
-          + os.path.dirname(nvidia.cudnn.lib.__file__))
-except Exception:
-    pass
+import glob, os, sysconfig
+dirs = sorted(glob.glob(os.path.join(
+    sysconfig.get_paths()["purelib"], "nvidia", "*", "lib")))
+print(":".join(dirs))
 PY
 )"
     if [ -n "$CUDA_LIBS" ]; then

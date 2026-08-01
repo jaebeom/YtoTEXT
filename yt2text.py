@@ -359,14 +359,14 @@ def _ffprobe_duration(path):
 
 
 def _preload_cuda_libs():
-    """pip으로 설치한 cuBLAS/cuDNN을 LD_LIBRARY_PATH 설정 없이도 쓸 수 있게
-    미리 로드 (환경변수 누락으로 'libcublas.so.12 not found'가 나는 문제 방지)."""
+    """pip으로 설치한 CUDA 라이브러리(cuBLAS/cuDNN 등)를 LD_LIBRARY_PATH 설정
+    없이도 쓸 수 있게 미리 로드. NVIDIA 패키지는 __init__.py 없는 네임스페이스
+    패키지라 import로는 경로가 안 나오는 경우가 있어 site-packages를 직접 뒤짐."""
     try:
         import ctypes
-        import nvidia.cublas.lib
-        import nvidia.cudnn.lib
-        for d in (os.path.dirname(nvidia.cublas.lib.__file__),
-                  os.path.dirname(nvidia.cudnn.lib.__file__)):
+        import sysconfig
+        for d in sorted(glob.glob(os.path.join(
+                sysconfig.get_paths()["purelib"], "nvidia", "*", "lib"))):
             for so in sorted(glob.glob(os.path.join(d, "*.so*"))):
                 try:
                     ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
