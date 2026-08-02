@@ -1158,9 +1158,27 @@ function plainText(){
 }
 
 async function copyText(){
-  await navigator.clipboard.writeText(plainText());
+  const text = plainText();
+  let ok = false;
+  try{
+    if(navigator.clipboard && window.isSecureContext){
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    }
+  }catch(e){}
+  if(!ok){
+    // HTTP(IP/Tailscale) 접속은 clipboard API가 막혀 있어서 구식 방식으로
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    try{ ok = document.execCommand('copy'); }catch(e){}
+    ta.remove();
+  }
   const b = $('copybtn');
-  b.textContent = '복사됨'; b.classList.add('done');
+  b.textContent = ok ? '복사됨' : '복사 실패';
+  b.classList.toggle('done', ok);
   setTimeout(()=>{ b.textContent='복사'; b.classList.remove('done'); }, 1500);
 }
 
