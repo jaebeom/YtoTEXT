@@ -225,10 +225,47 @@ def history_add(result):
                      args=(result["video_id"],), daemon=True).start()
 
 
+_title_fix_running = False
+
+
+def _fix_missing_titles():
+    """차단 등으로 제목을 못 가져와 영상 ID로 저장된 항목을 다시 채움."""
+    global _title_fix_running
+    try:
+        with _hist_lock:
+            broken = [e for e in _load_history()
+                      if e.get("title") == e.get("video_id")]
+        for e in broken:
+            title = fetch_title(e["video_id"])
+            if not title:
+                continue  # 아직 차단 중이면 다음 기회에
+            with _hist_lock:
+                entries = _load_history()
+                for x in entries:
+                    if x.get("key") == e["key"]:
+                        x["title"] = title
+                _save_history(entries)
+                p = _result_path(e["key"])  # 전문 파일 제목도 같이
+                try:
+                    res = json.loads(p.read_text(encoding="utf-8"))
+                    res["title"] = title
+                    _atomic_write(p, json.dumps(res, ensure_ascii=False))
+                except Exception:
+                    pass
+            time.sleep(random.uniform(1.0, 3.0))  # 제목 조회도 살살
+    finally:
+        _title_fix_running = False
+
+
 @app.get("/api/history")
 def api_history():
+    global _title_fix_running
     with _hist_lock:
         entries = _load_history()
+    if (not _title_fix_running
+            and any(e.get("title") == e.get("video_id") for e in entries)):
+        _title_fix_running = True
+        threading.Thread(target=_fix_missing_titles, daemon=True).start()
     slim = [{k: v for k, v in e.items() if k != "result"} for e in entries]
     return jsonify(slim)
 
@@ -1067,6 +1104,12 @@ async function loadHistory(){
       };
       grid.appendChild(card);
     });
+    // 제목이 깨진 항목이 있으면 서버가 뒤에서 복구 중 — 잠시 뒤 다시 불러옴
+    if(HIST.some(e => e.title === e.video_id) && !window._titlePoll){
+      window._titlePoll = setTimeout(()=>{
+        window._titlePoll = null; loadHistory();
+      }, 8000);
+    }
   }catch(e){}
 }
 
