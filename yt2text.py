@@ -15,6 +15,7 @@ v4 추가:
 
 import os
 import re
+import sys
 import glob
 import json
 import random
@@ -235,10 +236,12 @@ def _fix_missing_titles():
         with _hist_lock:
             broken = [e for e in _load_history()
                       if e.get("title") == e.get("video_id")]
+        fixed = 0
         for e in broken:
             title = fetch_title(e["video_id"])
             if not title:
                 continue  # 아직 차단 중이면 다음 기회에
+            fixed += 1
             with _hist_lock:
                 entries = _load_history()
                 for x in entries:
@@ -253,6 +256,11 @@ def _fix_missing_titles():
                 except Exception:
                     pass
             time.sleep(random.uniform(1.0, 3.0))  # 제목 조회도 살살
+        if broken:  # journalctl로 복구 상황을 볼 수 있게
+            note = "" if fixed == len(broken) else \
+                " (나머지는 유튜브 차단 중인 듯 — 다음 히스토리 로드 때 재시도)"
+            print(f"[제목복구] {len(broken)}개 중 {fixed}개 채움{note}",
+                  file=sys.stderr, flush=True)
     finally:
         _title_fix_running = False
 
@@ -498,7 +506,9 @@ def stt_worker(job_id, url, model_name, language):
                 subprocess.run(
                     ["ffmpeg", "-nostdin", "-loglevel", "error",
                      "-i", str(audio), "-f", "segment",
-                     "-segment_time", str(CHUNK_SEC), "-c", "copy",
+                     "-segment_time", str(CHUNK_SEC),
+                     "-reset_timestamps", "1",  # 청크마다 0초부터 — 안 하면
+                     "-c", "copy",              # 원본 시각이 남아 오프셋과 이중 합산됨
                      str(chunk_dir / f"part%04d{audio.suffix}")],
                     check=True, timeout=600)
                 chunks = sorted(chunk_dir.iterdir())
