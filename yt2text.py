@@ -229,6 +229,21 @@ def history_add(result):
 _title_fix_running = False
 
 
+def _fetch_title_hard(video_id: str):
+    """oembed로 안 되는 영상(임베드 금지 등은 401이 남)을 yt-dlp로 조회.
+    다운로드 없이 메타데이터만 가져옴 — 느리지만 확실해서 복구용으로만 씀."""
+    try:
+        import yt_dlp
+        opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+                "noplaylist": True}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={video_id}", download=False)
+        return info.get("title")
+    except Exception:
+        return None
+
+
 def _fix_missing_titles():
     """차단 등으로 제목을 못 가져와 영상 ID로 저장된 항목을 다시 채움."""
     global _title_fix_running
@@ -238,7 +253,7 @@ def _fix_missing_titles():
                       if e.get("title") == e.get("video_id")]
         fixed = 0
         for e in broken:
-            title = fetch_title(e["video_id"])
+            title = fetch_title(e["video_id"]) or _fetch_title_hard(e["video_id"])
             if not title:
                 continue  # 아직 차단 중이면 다음 기회에
             fixed += 1
