@@ -56,7 +56,8 @@ cd YtoTEXT
 
 ### Viewing · export
 - Paragraph view / timestamped view toggle, copy (works over plain-HTTP access too), `.txt` / `.md` / `.srt` downloads
-- **Copy for AI** — copies the transcript with a context header (title, channel, duration, URL, and the video description) so you can paste it straight into Gemini/ChatGPT/Claude and the model knows exactly what it's reading
+- **Copy for AI** — copies the transcript with a context header (title, channel, duration, URL, the video description, and the top comments) so you can paste it straight into Gemini/ChatGPT/Claude and the model knows exactly what it's reading
+- **Top comments** — every extraction also saves the 5 most-liked top-level comments (replies excluded, pinned/creator comments marked). They appear as a collapsed block above the transcript and go straight into Copy for AI, so the model sees how viewers reacted, not just what was said. Comment fetching never blocks the transcript — if YouTube refuses, you simply get the result without comments
 - The `.md` export also includes the channel name and video description
 - **YouTube ↗** link on every result; with timestamps on, each timestamp is a link that opens the video at that exact moment
 
@@ -64,7 +65,7 @@ cd YtoTEXT
 - Stores up to 300 extractions locally — thumbnail card grid, click to reopen, per-item delete
 - Slim index (`history.json`) and full transcripts (`results/`) are stored separately, with atomic writes that survive crashes
 - Thumbnails are backed up locally (cards survive even if a video is taken down)
-- Entries whose title couldn't be fetched (blocks, embed-disabled videos) are repaired automatically on a later history load — with a yt-dlp fallback for videos the oembed API refuses
+- Entries whose title couldn't be fetched (blocks, embed-disabled videos) are repaired automatically on a later history load — with a yt-dlp fallback for videos the oembed API refuses, which also backfills the top comments that block cost you
 
 ### Stability · security
 - Host-header check + JSON Content-Type enforcement — stops other websites from silently driving your local server (CSRF/DNS-rebinding defense)
@@ -75,6 +76,7 @@ cd YtoTEXT
 
 | Version | Notes |
 |---------|-------|
+| v4.3 | Top comments (5 most-liked) saved with every extraction, shown above the transcript and included in Copy for AI |
 | v4.2 | YouTube deep links & timestamp jumps, 50-video batches, caption pacing + automatic block recovery (+stop), long-video chunking, GPU auto-load with CPU fallback, Copy for AI with channel/description |
 | v4.1 | Stability & security (atomic writes, split storage, job cancel, CSRF defense), Ubuntu home-server installer |
 | v4 | Duplicate detection, batch extraction (queue/progress) |

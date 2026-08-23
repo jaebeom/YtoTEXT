@@ -53,6 +53,8 @@ def _check_host():
 PREFERRED = ["ko", "en"]
 HISTORY_MAX = 300
 BATCH_MAX = 50
+COMMENTS_MAX = 5     # 결과에 같이 저장할 인기 댓글 수 (AI용 복사에 들어감)
+COMMENT_POOL = 30    # 좋아요 순으로 추리려고 인기순 앞에서 긁어오는 후보 수
 
 DATA_DIR = Path(__file__).resolve().parent / "yt2text_data"
 HISTORY_FILE = DATA_DIR / "history.json"
@@ -231,21 +233,67 @@ def history_add(result):
 _title_fix_running = False
 
 
-def _fetch_meta_hard(video_id: str):
-    """yt-dlp로 제목·채널·설명 조회 (다운로드 없이 메타데이터만).
-    oembed보다 느리지만 임베드 금지 영상도 되고 설명(더보기란)까지 나옴."""
+def pick_top_comments(comments, limit=COMMENTS_MAX):
+    """yt-dlp 댓글 목록에서 좋아요 많은 순 상위 N개만 추림."""
+    picked = []
+    for c in comments or []:
+        if c.get("parent") not in (None, "root"):
+            continue  # 대댓글은 원댓글 없이 읽으면 맥락이 없어서 뺌
+        text = (c.get("text") or "").strip()
+        if not text:
+            continue
+        picked.append({
+            "author": (c.get("author") or "").lstrip("@") or "익명",
+            "text": text,
+            "likes": c.get("like_count") or 0,
+            "uploader": bool(c.get("author_is_uploader")),
+            "pinned": bool(c.get("is_pinned")),
+        })
+    picked.sort(key=lambda c: c["likes"], reverse=True)
+    return picked[:limit]
+
+
+def _ydl_extract(video_id: str, comments: int = 0):
+    """yt-dlp 메타데이터 조회 한 번. 실패하면 None.
+    comments>0이면 인기순 앞에서 후보만 긁어옴 (대댓글은 안 받음)."""
     try:
         import yt_dlp
         opts = {"quiet": True, "no_warnings": True, "skip_download": True,
                 "noplaylist": True}
+        if comments:
+            opts["getcomments"] = True
+            opts["extractor_args"] = {"youtube": {
+                "comment_sort": ["top"],
+                # 전체, 부모, 대댓글, 스레드당 대댓글 순서
+                "max_comments": [str(COMMENT_POOL), "all", "0", "0"],
+            }}
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(
+            return ydl.extract_info(
                 f"https://www.youtube.com/watch?v={video_id}", download=False)
+    except Exception:
+        return None
+
+
+def _fetch_meta_hard(video_id: str, comments: int = 0):
+    """yt-dlp로 제목·채널·설명 조회 (다운로드 없이 메타데이터만).
+    oembed보다 느리지만 임베드 금지 영상도 되고 설명(더보기란)까지 나옴.
+    comments>0이면 인기 댓글도 같은 요청에 얹어서 가져오고, 댓글 쪽이
+    터지면 댓글 없이 한 번 더 시도해서 제목·설명이라도 건짐."""
+    for want in ([comments, 0] if comments else [0]):
+        info = _ydl_extract(video_id, want)
+        if info is None:
+            continue
         return {"title": info.get("title"),
                 "channel": info.get("uploader") or info.get("channel"),
-                "description": info.get("description")}
-    except Exception:
-        return {}
+                "description": info.get("description"),
+                "comments": pick_top_comments(info.get("comments"), want)}
+    return {}
+
+
+def fetch_top_comments(video_id: str, limit: int = COMMENTS_MAX):
+    """인기 댓글만 따로 조회. 실패해도 빈 목록 — 본문 추출을 막지 않음."""
+    info = _ydl_extract(video_id, limit)
+    return pick_top_comments(info.get("comments") if info else None, limit)
 
 
 def _fix_missing_titles():
@@ -257,9 +305,11 @@ def _fix_missing_titles():
                       if e.get("title") == e.get("video_id")]
         fixed = 0
         for e in broken:
-            meta = fetch_meta(e["video_id"])
+            # 차단 때 놓친 건 제목만이 아니라 설명·댓글도 마찬가지라
+            # 추출 때와 같은 순서(yt-dlp 먼저, 안 되면 oembed)로 다시 채움
+            meta = _fetch_meta_hard(e["video_id"], COMMENTS_MAX)
             if not meta.get("title"):
-                meta = _fetch_meta_hard(e["video_id"])
+                meta = fetch_meta(e["video_id"])
             if not meta.get("title"):
                 continue  # 아직 차단 중이면 다음 기회에
             fixed += 1
@@ -277,6 +327,8 @@ def _fix_missing_titles():
                         res["channel"] = meta["channel"]
                     if meta.get("description"):
                         res["description"] = meta["description"]
+                    if meta.get("comments"):
+                        res["comments"] = meta["comments"]
                     _atomic_write(p, json.dumps(res, ensure_ascii=False))
                 except Exception:
                     pass
@@ -389,13 +441,15 @@ def api_transcript():
 
     items = [{"text": s.text, "start": s.start, "dur": s.duration or 0}
              for s in fetched]
-    meta = _fetch_meta_hard(video_id)  # 설명까지 — 임베드 금지 영상도 OK
+    # 설명·인기 댓글까지 한 번에 — 임베드 금지 영상도 OK
+    meta = _fetch_meta_hard(video_id, COMMENTS_MAX)
     if not meta.get("title"):
         meta = fetch_meta(video_id)    # yt-dlp 실패 시 가벼운 조회로 폴백
     res = build_result(video_id, meta.get("title"), items,
                        fetched.language, "caption")
     res["channel"] = meta.get("channel")
     res["description"] = meta.get("description")
+    res["comments"] = meta.get("comments") or []
     res["available"] = available
     res["language_code"] = fetched.language_code
     res["is_generated"] = fetched.is_generated
@@ -593,10 +647,16 @@ def stt_worker(job_id, url, model_name, language):
                 lang = lang or seg_info.language  # 청크 간 언어 통일
                 offset += _ffprobe_duration(chunk) or CHUNK_SEC
 
+        # 댓글은 다운로드 요청에 섞지 않고 따로 — 댓글 쪽이 터져도
+        # 다 끝낸 받아쓰기가 같이 날아가면 안 되니까
+        job.update(phase="인기 댓글 가져오는 중")
+        comments = fetch_top_comments(video_id)
+
         res = build_result(video_id, title, items,
                            lang or seg_info.language, f"whisper:{model_name}")
         res["channel"] = channel
         res["description"] = info.get("description")
+        res["comments"] = comments
         history_add(res)
         job.update(status="done", progress=100, result=res,
                    ended_at=time.time())
@@ -762,6 +822,17 @@ PAGE = r"""<!doctype html>
   .body .row{display:flex;margin-bottom:.5em}
   .body .row span:last-child{font-size:15px;line-height:1.7;color:var(--ink)}
 
+  .cmts{border:1px solid var(--line);border-radius:10px;padding:11px 15px;margin-bottom:26px}
+  .cmts summary{font-family:var(--mono);font-size:11.5px;letter-spacing:.04em;
+       color:var(--ink-soft);cursor:pointer;list-style:none}
+  .cmts summary::-webkit-details-marker{display:none}
+  .cmts summary::before{content:'▸ '}
+  .cmts[open] summary::before{content:'▾ '}
+  .cmts .cmt{margin-top:15px}
+  .cmts .chead{font-family:var(--mono);font-size:11px;color:var(--ink-soft)}
+  .cmts .ctext{font-size:14px;line-height:1.7;color:var(--ink);margin-top:5px;
+       white-space:pre-wrap;word-break:keep-all}
+
   .histhead{display:flex;align-items:baseline;gap:10px;margin:40px 0 14px}
   .histhead .lab{font-family:var(--mono);font-size:12px;letter-spacing:.16em;color:var(--fg-soft)}
   .histhead .cnt{font-family:var(--mono);font-size:12px;color:#5A6068}
@@ -833,7 +904,7 @@ PAGE = r"""<!doctype html>
         <div class="sp"></div>
         <button class="tbtn" id="copybtn" data-label="복사" onclick="copyText()">복사</button>
         <button class="tbtn" id="aicopybtn" data-label="AI용 복사"
-          title="제목·채널·길이·URL을 머리말로 붙여서 복사 — AI에 바로 붙여넣기 좋게"
+          title="제목·채널·길이·URL·설명·인기 댓글을 머리말로 붙여서 복사 — AI에 바로 붙여넣기 좋게"
           onclick="copyAI()">AI용 복사</button>
         <button class="tbtn" onclick="dl('txt')">.txt</button>
         <button class="tbtn" onclick="dl('md')">.md</button>
@@ -1220,9 +1291,36 @@ function tsSec(l){  // 구버전 히스토리엔 s(초)가 없으니 "H:MM:SS"�
   return l.t.split(':').map(Number).reduce((a,b)=>a*60+b, 0);
 }
 
+function cmtHead(c){  // "작성자 · 좋아요 1,234 · 고정"
+  const tags = ['좋아요 ' + (c.likes || 0).toLocaleString()];
+  if(c.pinned) tags.push('고정');
+  if(c.uploader) tags.push('채널 주인');
+  return c.author + ' · ' + tags.join(' · ');
+}
+
+function commentsBlock(){  // 접어둔 채로 본문 위에 — 있는지 없는지는 보이게
+  const cs = D.comments || [];
+  if(!cs.length) return null;
+  const d = document.createElement('details'); d.className = 'cmts';
+  const sm = document.createElement('summary');
+  sm.textContent = `인기 댓글 ${cs.length}개 · 좋아요 순`;
+  d.appendChild(sm);
+  cs.forEach(c=>{
+    const w = document.createElement('div'); w.className = 'cmt';
+    const h = document.createElement('div'); h.className = 'chead';
+    h.textContent = cmtHead(c);
+    const t = document.createElement('div'); t.className = 'ctext';
+    t.textContent = c.text;
+    w.append(h,t); d.appendChild(w);
+  });
+  return d;
+}
+
 function render(){
   const out = $('out');
   out.innerHTML = '';
+  const cb = commentsBlock();
+  if(cb) out.appendChild(cb);
   if($('tsbox').checked){
     D.lines.forEach(l=>{
       const d = document.createElement('div'); d.className='row';
@@ -1286,6 +1384,11 @@ function aiText(){  // AI에 붙여넣을 때 맥락을 잡아주는 머리말 +
     'URL: https://youtu.be/' + D.video_id
   ];
   if(D.description) out.push('', '--- 영상 설명 ---', D.description.trim());
+  const cs = D.comments || [];
+  if(cs.length){
+    out.push('', `--- 인기 댓글 ${cs.length}개 (좋아요 순, 시청자가 쓴 글) ---`);
+    cs.forEach(c=> out.push('', cmtHead(c), c.text.trim()));
+  }
   out.push('', '--- 스크립트 ---', plainText());
   return out.join('\n');
 }
