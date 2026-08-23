@@ -232,8 +232,8 @@ _title_fix_running = False
 
 
 def _fetch_meta_hard(video_id: str):
-    """oembed로 안 되는 영상(임베드 금지 등은 401이 남)을 yt-dlp로 조회.
-    다운로드 없이 메타데이터만 가져옴 — 느리지만 확실해서 복구용으로만 씀."""
+    """yt-dlp로 제목·채널·설명 조회 (다운로드 없이 메타데이터만).
+    oembed보다 느리지만 임베드 금지 영상도 되고 설명(더보기란)까지 나옴."""
     try:
         import yt_dlp
         opts = {"quiet": True, "no_warnings": True, "skip_download": True,
@@ -242,7 +242,8 @@ def _fetch_meta_hard(video_id: str):
             info = ydl.extract_info(
                 f"https://www.youtube.com/watch?v={video_id}", download=False)
         return {"title": info.get("title"),
-                "channel": info.get("uploader") or info.get("channel")}
+                "channel": info.get("uploader") or info.get("channel"),
+                "description": info.get("description")}
     except Exception:
         return {}
 
@@ -274,6 +275,8 @@ def _fix_missing_titles():
                     res["title"] = meta["title"]
                     if meta.get("channel"):
                         res["channel"] = meta["channel"]
+                    if meta.get("description"):
+                        res["description"] = meta["description"]
                     _atomic_write(p, json.dumps(res, ensure_ascii=False))
                 except Exception:
                     pass
@@ -386,10 +389,13 @@ def api_transcript():
 
     items = [{"text": s.text, "start": s.start, "dur": s.duration or 0}
              for s in fetched]
-    meta = fetch_meta(video_id)
+    meta = _fetch_meta_hard(video_id)  # 설명까지 — 임베드 금지 영상도 OK
+    if not meta.get("title"):
+        meta = fetch_meta(video_id)    # yt-dlp 실패 시 가벼운 조회로 폴백
     res = build_result(video_id, meta.get("title"), items,
                        fetched.language, "caption")
     res["channel"] = meta.get("channel")
+    res["description"] = meta.get("description")
     res["available"] = available
     res["language_code"] = fetched.language_code
     res["is_generated"] = fetched.is_generated
@@ -590,6 +596,7 @@ def stt_worker(job_id, url, model_name, language):
         res = build_result(video_id, title, items,
                            lang or seg_info.language, f"whisper:{model_name}")
         res["channel"] = channel
+        res["description"] = info.get("description")
         history_add(res)
         job.update(status="done", progress=100, result=res,
                    ended_at=time.time())
@@ -1270,17 +1277,17 @@ function flashBtn(id, ok){
 async function copyText(){ flashBtn('copybtn', await writeClipboard(plainText())); }
 
 function aiText(){  // AI에 붙여넣을 때 맥락을 잡아주는 머리말 + 전문
-  return [
+  const out = [
     '다음은 유튜브 영상에서 추출한 스크립트야. 영상 정보를 참고해서 읽어줘.',
     '',
     '제목: ' + (D.title || '(제목 없음)'),
     '채널: ' + (D.channel || '(알 수 없음)'),
     '영상 길이: ' + (D.duration || '?'),
-    'URL: https://youtu.be/' + D.video_id,
-    '',
-    '--- 스크립트 ---',
-    plainText()
-  ].join('\n');
+    'URL: https://youtu.be/' + D.video_id
+  ];
+  if(D.description) out.push('', '--- 영상 설명 ---', D.description.trim());
+  out.push('', '--- 스크립트 ---', plainText());
+  return out.join('\n');
 }
 
 async function copyAI(){ flashBtn('aicopybtn', await writeClipboard(aiText())); }
@@ -1291,6 +1298,7 @@ function dl(kind){
     text = D.lines.map((l,i)=>`${i+1}\n${l.srt_a} --> ${l.srt_b}\n${l.text}\n`).join('\n');
   }else if(kind==='md'){
     text = `# ${D.title || D.video_id}\n\n> https://youtu.be/${D.video_id}${D.channel ? ' · ' + D.channel : ''} · ${D.duration} · ${D.language}\n\n`
+         + (D.description ? D.description.trim() + '\n\n---\n\n' : '')
          + D.paragraphs.join('\n\n');
   }else{
     text = plainText();
