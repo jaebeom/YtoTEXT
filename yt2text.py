@@ -85,15 +85,17 @@ def extract_video_id(url: str):
     return m.group(1) if m else None
 
 
-def fetch_title(video_id: str):
+def fetch_meta(video_id: str):
+    """oembed로 제목·채널명 조회. 실패하면 빈 dict (임베드 금지 영상은 401)."""
     try:
         u = "https://www.youtube.com/oembed?url=" + quote(
             f"https://www.youtube.com/watch?v={video_id}", safe=""
         ) + "&format=json"
         with urlopen(u, timeout=5) as r:
-            return json.loads(r.read().decode()).get("title")
+            d = json.loads(r.read().decode())
+        return {"title": d.get("title"), "channel": d.get("author_name")}
     except Exception:
-        return None
+        return {}
 
 
 def to_paragraphs(items, gap=4.0):
@@ -229,7 +231,7 @@ def history_add(result):
 _title_fix_running = False
 
 
-def _fetch_title_hard(video_id: str):
+def _fetch_meta_hard(video_id: str):
     """oembed로 안 되는 영상(임베드 금지 등은 401이 남)을 yt-dlp로 조회.
     다운로드 없이 메타데이터만 가져옴 — 느리지만 확실해서 복구용으로만 씀."""
     try:
@@ -239,9 +241,10 @@ def _fetch_title_hard(video_id: str):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(
                 f"https://www.youtube.com/watch?v={video_id}", download=False)
-        return info.get("title")
+        return {"title": info.get("title"),
+                "channel": info.get("uploader") or info.get("channel")}
     except Exception:
-        return None
+        return {}
 
 
 def _fix_missing_titles():
@@ -253,20 +256,24 @@ def _fix_missing_titles():
                       if e.get("title") == e.get("video_id")]
         fixed = 0
         for e in broken:
-            title = fetch_title(e["video_id"]) or _fetch_title_hard(e["video_id"])
-            if not title:
+            meta = fetch_meta(e["video_id"])
+            if not meta.get("title"):
+                meta = _fetch_meta_hard(e["video_id"])
+            if not meta.get("title"):
                 continue  # 아직 차단 중이면 다음 기회에
             fixed += 1
             with _hist_lock:
                 entries = _load_history()
                 for x in entries:
                     if x.get("key") == e["key"]:
-                        x["title"] = title
+                        x["title"] = meta["title"]
                 _save_history(entries)
-                p = _result_path(e["key"])  # 전문 파일 제목도 같이
+                p = _result_path(e["key"])  # 전문 파일 제목·채널도 같이
                 try:
                     res = json.loads(p.read_text(encoding="utf-8"))
-                    res["title"] = title
+                    res["title"] = meta["title"]
+                    if meta.get("channel"):
+                        res["channel"] = meta["channel"]
                     _atomic_write(p, json.dumps(res, ensure_ascii=False))
                 except Exception:
                     pass
@@ -379,8 +386,10 @@ def api_transcript():
 
     items = [{"text": s.text, "start": s.start, "dur": s.duration or 0}
              for s in fetched]
-    res = build_result(video_id, fetch_title(video_id), items,
+    meta = fetch_meta(video_id)
+    res = build_result(video_id, meta.get("title"), items,
                        fetched.language, "caption")
+    res["channel"] = meta.get("channel")
     res["available"] = available
     res["language_code"] = fetched.language_code
     res["is_generated"] = fetched.is_generated
@@ -507,6 +516,7 @@ def stt_worker(job_id, url, model_name, language):
         check_cancel()
         audio = next(p for p in tmp.iterdir() if p.is_file())
         title = info.get("title")
+        channel = info.get("uploader") or info.get("channel")
         duration = info.get("duration") or 0
         video_id = info.get("id") or extract_video_id(url) or "video"
         job["title"] = title  # 큐 행 제목 갱신용
@@ -579,6 +589,7 @@ def stt_worker(job_id, url, model_name, language):
 
         res = build_result(video_id, title, items,
                            lang or seg_info.language, f"whisper:{model_name}")
+        res["channel"] = channel
         history_add(res)
         job.update(status="done", progress=100, result=res,
                    ended_at=time.time())
@@ -813,7 +824,10 @@ PAGE = r"""<!doctype html>
       <div class="tools">
         <label><input type="checkbox" id="tsbox" onchange="render()"> 타임스탬프</label>
         <div class="sp"></div>
-        <button class="tbtn" id="copybtn" onclick="copyText()">복사</button>
+        <button class="tbtn" id="copybtn" data-label="복사" onclick="copyText()">복사</button>
+        <button class="tbtn" id="aicopybtn" data-label="AI용 복사"
+          title="제목·채널·길이·URL을 머리말로 붙여서 복사 — AI에 바로 붙여넣기 좋게"
+          onclick="copyAI()">AI용 복사</button>
         <button class="tbtn" onclick="dl('txt')">.txt</button>
         <button class="tbtn" onclick="dl('md')">.md</button>
         <button class="tbtn" onclick="dl('srt')">.srt</button>
@@ -1225,8 +1239,7 @@ function plainText(){
   return D.paragraphs.join('\n\n');
 }
 
-async function copyText(){
-  const text = plainText();
+async function writeClipboard(text){
   let ok = false;
   try{
     if(navigator.clipboard && window.isSecureContext){
@@ -1244,18 +1257,40 @@ async function copyText(){
     try{ ok = document.execCommand('copy'); }catch(e){}
     ta.remove();
   }
-  const b = $('copybtn');
+  return ok;
+}
+
+function flashBtn(id, ok){
+  const b = $(id);
   b.textContent = ok ? '복사됨' : '복사 실패';
   b.classList.toggle('done', ok);
-  setTimeout(()=>{ b.textContent='복사'; b.classList.remove('done'); }, 1500);
+  setTimeout(()=>{ b.textContent = b.dataset.label; b.classList.remove('done'); }, 1500);
 }
+
+async function copyText(){ flashBtn('copybtn', await writeClipboard(plainText())); }
+
+function aiText(){  // AI에 붙여넣을 때 맥락을 잡아주는 머리말 + 전문
+  return [
+    '다음은 유튜브 영상에서 추출한 스크립트야. 영상 정보를 참고해서 읽어줘.',
+    '',
+    '제목: ' + (D.title || '(제목 없음)'),
+    '채널: ' + (D.channel || '(알 수 없음)'),
+    '영상 길이: ' + (D.duration || '?'),
+    'URL: https://youtu.be/' + D.video_id,
+    '',
+    '--- 스크립트 ---',
+    plainText()
+  ].join('\n');
+}
+
+async function copyAI(){ flashBtn('aicopybtn', await writeClipboard(aiText())); }
 
 function dl(kind){
   let text, name = (D.title || D.video_id).replace(/[\\/:*?"<>|]/g,'_');
   if(kind==='srt'){
     text = D.lines.map((l,i)=>`${i+1}\n${l.srt_a} --> ${l.srt_b}\n${l.text}\n`).join('\n');
   }else if(kind==='md'){
-    text = `# ${D.title || D.video_id}\n\n> https://youtu.be/${D.video_id} · ${D.duration} · ${D.language}\n\n`
+    text = `# ${D.title || D.video_id}\n\n> https://youtu.be/${D.video_id}${D.channel ? ' · ' + D.channel : ''} · ${D.duration} · ${D.language}\n\n`
          + D.paragraphs.join('\n\n');
   }else{
     text = plainText();
