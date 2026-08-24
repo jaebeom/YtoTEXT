@@ -55,6 +55,9 @@ HISTORY_MAX = 300
 BATCH_MAX = 50
 COMMENTS_MAX = 5     # 결과에 같이 저장할 인기 댓글 수 (AI용 복사에 들어감)
 COMMENT_POOL = 30    # 좋아요 순으로 추리려고 인기순 앞에서 긁어오는 후보 수
+COMMENT_TIMEOUT = 10  # 댓글 요청 응답 대기 상한(초) — 부가정보라 오래 안 기다림
+TITLE_FIX_MAX = 20   # 제목 복구 한 번에 시도할 항목 수
+TITLE_FIX_COOL = 300  # 복구 실패 시 첫 쿨다운(초). 반복되면 2배씩, 최대 1시간
 
 DATA_DIR = Path(__file__).resolve().parent / "yt2text_data"
 HISTORY_FILE = DATA_DIR / "history.json"
@@ -231,6 +234,8 @@ def history_add(result):
 
 
 _title_fix_running = False
+_title_fix_until = 0.0        # 복구 쿨다운이 풀리는 시각
+_title_fix_cool = TITLE_FIX_COOL  # 실패가 반복되면 2배씩, 최대 1시간
 
 
 def pick_top_comments(comments, limit=COMMENTS_MAX):
@@ -267,6 +272,10 @@ def _ydl_extract(video_id: str, comments: int = 0):
                 # 전체, 부모, 대댓글, 스레드당 대댓글 순서
                 "max_comments": [str(COMMENT_POOL), "all", "0", "0"],
             }}
+            # 댓글은 있으면 좋은 부가정보라 오래 붙들지 않게 시간 예산을 둠 —
+            # 예외는 안 나도 느리게 끄는 응답이 본문 저장을 잡아둘 수 있어서
+            opts.update(socket_timeout=COMMENT_TIMEOUT,
+                        extractor_retries=1, retries=1)
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(
                 f"https://www.youtube.com/watch?v={video_id}", download=False)
@@ -303,13 +312,16 @@ def _fix_missing_titles():
         with _hist_lock:
             broken = [e for e in _load_history()
                       if e.get("title") == e.get("video_id")]
+        broken = broken[:TITLE_FIX_MAX]  # 한 번에 몰아치지 않게
         fixed = 0
         for e in broken:
-            # 차단 때 놓친 건 제목만이 아니라 설명·댓글도 마찬가지라
-            # 추출 때와 같은 순서(yt-dlp 먼저, 안 되면 oembed)로 다시 채움
-            meta = _fetch_meta_hard(e["video_id"], COMMENTS_MAX)
+            # 싼 조회(oembed) 먼저, 안 되면 yt-dlp — 복구는 보통 차단 직후에
+            # 도는 거라 비싼 요청을 앞세우면 차단을 더 키움.
+            # 댓글은 여기서 안 건드림 (제목 채우자고 댓글 요청까지 낼 이유 없음)
+            meta = fetch_meta(e["video_id"])
             if not meta.get("title"):
-                meta = fetch_meta(e["video_id"])
+                meta = _fetch_meta_hard(e["video_id"])
+            time.sleep(random.uniform(1.0, 3.0))  # 성공이든 실패든 살살
             if not meta.get("title"):
                 continue  # 아직 차단 중이면 다음 기회에
             fixed += 1
@@ -327,19 +339,29 @@ def _fix_missing_titles():
                         res["channel"] = meta["channel"]
                     if meta.get("description"):
                         res["description"] = meta["description"]
-                    if meta.get("comments"):
-                        res["comments"] = meta["comments"]
                     _atomic_write(p, json.dumps(res, ensure_ascii=False))
                 except Exception:
                     pass
-            time.sleep(random.uniform(1.0, 3.0))  # 제목 조회도 살살
         if broken:  # journalctl로 복구 상황을 볼 수 있게
+            _title_fix_cooldown(failed=fixed < len(broken))
+            wait = max(1, round((_title_fix_until - time.time()) / 60))
             note = "" if fixed == len(broken) else \
-                " (나머지는 유튜브 차단 중인 듯 — 다음 히스토리 로드 때 재시도)"
+                f" (나머지는 유튜브 차단 중인 듯 — {wait}분 뒤 재시도)"
             print(f"[제목복구] {len(broken)}개 중 {fixed}개 채움{note}",
                   file=sys.stderr, flush=True)
     finally:
         _title_fix_running = False
+
+
+def _title_fix_cooldown(failed: bool):
+    """복구에 실패한 게 있으면 다음 복구를 미뤄둠. 히스토리 화면은 제목이
+    안 채워지면 8초마다 다시 부르는데, 그때마다 재시도하면 차단만 길어짐."""
+    global _title_fix_until, _title_fix_cool
+    if failed:
+        _title_fix_until = time.time() + _title_fix_cool
+        _title_fix_cool = min(_title_fix_cool * 2, 3600)
+    else:
+        _title_fix_until, _title_fix_cool = 0.0, TITLE_FIX_COOL
 
 
 @app.get("/api/history")
@@ -347,7 +369,7 @@ def api_history():
     global _title_fix_running
     with _hist_lock:
         entries = _load_history()
-    if (not _title_fix_running
+    if (not _title_fix_running and _title_fix_until <= time.time()
             and any(e.get("title") == e.get("video_id") for e in entries)):
         _title_fix_running = True
         threading.Thread(target=_fix_missing_titles, daemon=True).start()
@@ -649,8 +671,10 @@ def stt_worker(job_id, url, model_name, language):
 
         # 댓글은 다운로드 요청에 섞지 않고 따로 — 댓글 쪽이 터져도
         # 다 끝낸 받아쓰기가 같이 날아가면 안 되니까
+        check_cancel()
         job.update(phase="인기 댓글 가져오는 중")
         comments = fetch_top_comments(video_id)
+        check_cancel()  # 요청 자체는 못 끊으니 시간 상한과 같이 걸어둠
 
         res = build_result(video_id, title, items,
                            lang or seg_info.language, f"whisper:{model_name}")
@@ -1386,7 +1410,7 @@ function aiText(){  // AI에 붙여넣을 때 맥락을 잡아주는 머리말 +
   if(D.description) out.push('', '--- 영상 설명 ---', D.description.trim());
   const cs = D.comments || [];
   if(cs.length){
-    out.push('', `--- 인기 댓글 ${cs.length}개 (좋아요 순, 시청자가 쓴 글) ---`);
+    out.push('', `--- 인기 댓글 ${cs.length}개 (유튜브 인기순 상위 중 좋아요 많은 순 · 시청자가 쓴 글) ---`);
     cs.forEach(c=> out.push('', cmtHead(c), c.text.trim()));
   }
   out.push('', '--- 스크립트 ---', plainText());

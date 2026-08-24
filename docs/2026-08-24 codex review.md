@@ -379,26 +379,110 @@ Please respond under each item with one of:
 
 ### R1 response
 
-_Pending._
+`AGREE — will change` — 고쳤어요.
+
+복구 경로를 리뷰가 지적한 대로 되돌리고, 폭주를 막는 장치를 더했습니다.
+
+- oembed 먼저, 실패하면 yt-dlp(메타데이터만). 댓글은 복구 경로에서 아예 안 부릅니다.
+- 결과 파일의 `res["comments"]` 백필도 같이 제거했습니다 (댓글 없이 복구되므로 죽은 코드).
+- `time.sleep(1~3s)`를 실패한 항목에도 겁니다. 기존에는 성공했을 때만 쉬었습니다 — 이 PR 이전부터 있던 문제인데 이번에 같이 고쳤습니다.
+- 한 번에 `TITLE_FIX_MAX = 20`개까지만 시도합니다.
+- 실패가 남은 패스 뒤에는 쿨다운을 겁니다 (`TITLE_FIX_COOL = 300`초 시작, 반복되면 2배씩 최대 1시간). `/api/history`는 쿨다운 중이면 복구 스레드를 아예 띄우지 않습니다. 전부 성공한 패스는 쿨다운을 0으로 리셋해서, 남은 항목이 있으면 다음 조회에서 이어서 처리합니다.
+
+수용 기준 대비:
+
+| 기준 | 상태 |
+|---|---|
+| 항목당 yt-dlp 추출 1회 이하 | ✅ oembed 성공 시 0회, 실패 시 1회 |
+| 제목 복구에 댓글 요청 없음 | ✅ `test_repair_never_requests_comments` |
+| 실패 항목에도 페이싱 | ✅ `test_pass_is_capped_and_paced` |
+| 8초 폴링이 버스트를 재시작 못 함 | ✅ `test_history_poll_during_backoff_starts_nothing` |
+
+리뷰가 제안한 "별도의 댓글 백필 작업(영상별 타임스탬프·지수 쿨다운)"은 넣지 않았습니다. 차단 때 놓친 옛 항목은 다시 추출하면 댓글이 채워지고, 그걸 위해 상시 도는 백그라운드 작업을 하나 더 두는 건 이 앱 규모에 과하다고 봤습니다. 필요하면 별도 PR로 하겠습니다.
 
 ### R2 response
 
-_Pending._
+`AGREE — will change` (구조 개선은 `AGREE — follow-up PR`)
+
+댓글 요청에만 시간 예산을 걸었습니다.
+
+```python
+opts.update(socket_timeout=COMMENT_TIMEOUT,   # 10
+            extractor_retries=1, retries=1)
+```
+
+정확히 해두면 — 이건 **요청당 응답 대기 상한**이지 전체 벽시계 데드라인이 아닙니다. 댓글은 continuation 페이지를 몇 번 받아오므로 최악의 경우 10초짜리 대기가 몇 번 이어질 수 있습니다. "무한정 붙들리지 않는다"는 보장되지만 "최대 10초"는 아닙니다.
+
+두 가지는 일부러 범위 밖에 뒀습니다.
+
+- 댓글 없는 메타데이터 조회(`comments=0`)에는 타임아웃을 안 걸었습니다. 이 PR 이전과 동작을 똑같이 유지하려고요. 원하시면 같이 걸겠습니다.
+- 리뷰가 더 낫다고 한 비동기 구조(본문 먼저 저장 → 댓글은 나중에 `comments`만 원자적 업데이트)는 안 했습니다. 프론트에 갱신 신호가 필요해서 이 PR보다 덩치가 커집니다. 후속 PR로 하는 게 맞다고 봅니다.
+
+`opts`가 실제로 그렇게 들어가는지는 `CommentRequestBudget` 테스트 두 개로 고정했습니다 (댓글 요청엔 붙고, 메타데이터 요청엔 안 붙음). yt-dlp 2026.08.19에서 `socket_timeout`·`extractor_retries`가 읽히는 것도 확인했습니다.
 
 ### R3 response
 
-_Pending._
+`AGREE — will change` — 고쳤습니다.
+
+```python
+check_cancel()
+job.update(phase="인기 댓글 가져오는 중")
+comments = fetch_top_comments(video_id)
+check_cancel()  # 요청 자체는 못 끊으니 시간 상한과 같이 걸어둠
+```
+
+지적대로 이미 나간 요청을 끊지는 못하므로 R2의 상한과 짝입니다. 뒤쪽 `check_cancel()`은 이미 끝난 받아쓰기를 버리게 되는데, 취소 중 다른 단계와 동작이 같아야 한다고 보고 리뷰 의견대로 넣었습니다.
 
 ### R4 response
 
-_Pending._
+`AGREE — will change` — 문구를 고쳤습니다.
+
+- AI용 복사 머리말: `--- 인기 댓글 N개 (유튜브 인기순 상위 중 좋아요 많은 순 · 시청자가 쓴 글) ---`
+- README(영문): "5 top-level comments, picked by like count out of the candidates YouTube ranks highest (up to 30 scanned)"
+- README(한국어): "유튜브 인기순 상위 후보(최대 30개)를 훑어서 좋아요 많은 원댓글 5개"
+- 버전 히스토리 두 줄도 같이 수정
+
+UI 요약 라벨은 리뷰가 준 대안대로 `인기 댓글 N개 · 좋아요 순`으로 짧게 뒀습니다. 이건 화면에 보이는 항목들의 정렬 순서를 그대로 말하는 거라 과장이 아니고, 후보 풀은 README에 적었습니다.
 
 ### R5 response
 
-_Pending._
+`AGREE — will change` (CI 연결은 `NEEDS DISCUSSION`)
+
+`tests/test_comments.py`에 결정적 테스트 22개를 추가했습니다. 표준 라이브러리 `unittest`만 쓰고 네트워크는 안 탑니다 (yt-dlp 호출은 전부 스텁).
+
+```
+python3 -m unittest discover -s tests
+Ran 22 tests in 0.064s — OK
+```
+
+요청하신 매트릭스 대비:
+
+- `pick_top_comments()` 8항목 — 대댓글/빈 본문 제외, `None` 좋아요 → 0, `@핸들` 정규화, `익명` 폴백, 고정·업로더 플래그 보존, 좋아요 내림차순, limit — 전부 커버
+- `_fetch_meta_hard()` — 댓글 성공 시 1회 호출, 댓글 실패 시 의도한 폴백만, 메타데이터 전용은 추가 호출 없음 — 커버. **타임아웃 예산 반환은 옵션 주입 검증으로 대체**했습니다 (실제 시간 측정은 네트워크가 필요해서요)
+- 복구/레이트리밋 4항목 — R1 표 참고
+
+브라우저 쪽은 헤드리스 크로미움으로 확인했지만 **커밋하진 않았습니다**. playwright를 이 프로젝트 의존성에 넣는 게 부담이라서요. 이번에 확인한 것:
+
+- `<img src=x onerror="window.__pwned=1">`를 작성자·본문에 넣었을 때 → `.cmts img` 0개, `window.__pwned` 미실행, 화면·AI 복사 모두 글자 그대로
+- 댓글 없는 옛 결과 렌더 및 AI 복사 정상, 타임스탬프 토글에도 블록 유지, 일반 복사에 댓글 안 섞임, AI 복사 순서(설명 → 댓글 → 스크립트)
+- JS 에러 0건
+
+GitHub Actions 워크플로는 추가하지 않았습니다 — 개인 저장소에 CI를 새로 붙이는 건 제가 임의로 정할 일이 아닌 것 같아서요. 원하시면 `python3 -m unittest`만 도는 최소 워크플로를 바로 올리겠습니다.
 
 ## 10. Resolution log
 
-Use this section after discussion to record the final agreement, commits, verification evidence, and merge decision.
+- **적용 커밋:** `docs/2026-08-24 codex review.md` 다음 커밋 (R1–R5 대응)
+- **베이스:** `main` (`3edc470`) ← `claude/comments-ai-paste-sua19a`
+- **바뀐 파일:** `yt2text.py`, `README.md`, `README.ko.md`, `tests/test_comments.py` (신규)
 
-_Pending._
+| 항목 | 결론 | 이 PR에서 처리 |
+|---|---|---|
+| R1 (blocker) | AGREE | ✅ oembed 우선 + 댓글 제거 + 페이싱 + 20개 상한 + 쿨다운 |
+| R2 | AGREE | ✅ 댓글 요청 시간 예산 / ⏭ 비동기 구조는 후속 |
+| R3 | AGREE | ✅ 앞뒤 `check_cancel()` |
+| R4 | AGREE | ✅ 머리말·README 문구 |
+| R5 | AGREE | ✅ 단위 테스트 22개 / ❓ CI 워크플로는 확인 필요 |
+
+**검증:** `python3 -m unittest discover -s tests` 22개 통과. 헤드리스 크로미움으로 XSS·하위호환·복사 동작 확인 (위 R5 참고). 실제 유튜브 호출은 이 작업 환경에서 프록시에 막혀 못 돌렸습니다 — 홈서버에서 한 편 뽑아보고 댓글이 붙는지, journalctl에 `[제목복구]` 로그가 정상인지 확인 부탁드립니다.
+
+**남은 논의:** R2 비동기 백필(후속 PR 여부), R5 CI 워크플로 추가 여부, R1의 별도 댓글 백필 작업 필요 여부.
