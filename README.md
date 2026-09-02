@@ -65,6 +65,7 @@ cd YtoTEXT
 - Stores up to 300 extractions locally — thumbnail card grid, click to reopen, per-item delete
 - **Folders** — a sidebar beside the grid. Create folders by theme and file videos into them by dragging a card onto a folder or picking one from the card's 🗂 button. Clicking a folder filters the grid, and the folder you were last in is remembered across reloads. Deleting a folder never deletes videos — they simply go back to *미분류* (unfiled)
 - **Re-extract from a card** — the ↻ button re-runs that video exactly the way it was pulled the first time (captions, or the same Whisper model), queues it like any other job, and replaces that history entry while keeping its folder
+- **Sorting** — newest / oldest, by title (Korean collation: Hangul first, then Latin) or reversed, and by video length either way. It applies within the folder you're viewing and is remembered across reloads
 - Slim index (`history.json`) and full transcripts (`results/`) are stored separately, with atomic writes that survive crashes
 - Thumbnails are backed up locally (cards survive even if a video is taken down)
 - Entries whose title couldn't be fetched (blocks, embed-disabled videos) are repaired automatically on a later history load — cheap oembed lookup first, with a yt-dlp fallback for videos it refuses. Repair is deliberately frugal: 20 entries per pass, a pause after every attempt, and a cooldown (5 min, doubling to 1 h) after a failed pass so a still-blocked host isn't hammered on every history reload
@@ -78,6 +79,7 @@ cd YtoTEXT
 
 | Version | Notes |
 |---------|-------|
+| v4.5 | History sorting (date / title / video length) |
 | v4.4 | History folders (sidebar, drag-and-drop filing, per-folder filtering) and a re-extract button on every card |
 | v4.3 | Top comments (5 picked by likes from YouTube's top-ranked candidates) saved with every extraction, shown above the transcript and included in Copy for AI |
 | v4.2 | YouTube deep links & timestamp jumps, 50-video batches, caption pacing + automatic block recovery (+stop), long-video chunking, GPU auto-load with CPU fallback, Copy for AI with channel/description |
