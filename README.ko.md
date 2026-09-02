@@ -71,6 +71,29 @@ cd YtoTEXT
 - 썸네일 로컬 백업 (영상이 지워져도 카드 유지)
 - 제목을 못 가져온 항목(차단, 임베드 금지 영상 등)은 히스토리를 열 때 자동으로 다시 채움 — 싼 조회(oembed) 먼저, 안 되면 yt-dlp로 한 번 더. 복구는 일부러 얌전하게: 한 번에 20개까지, 시도마다 쉬고, 실패가 남으면 쿨다운(5분부터 최대 1시간)을 걸어서 히스토리를 다시 열어도 바로 재시도하지 않음
 
+### 팀과 같이 쓰기 (선택)
+
+- **계정 2개** — 주인(`YT2TEXT_OWNER_PW`)과 팀 공용(`YT2TEXT_TEAM_PW`). 환경변수로 비밀번호를 넣으면 로그인 화면이 켜지고, 안 넣으면 예전처럼 로그인 없이 동작
+- **기록이 안 섞임** — 히스토리·폴더가 계정별로 완전히 분리됨. 같은 영상을 둘이 뽑아도 서로 덮어쓰지 않고, 남의 기록은 열지도 지우지도 못함. `user` 필드가 없는 기존 기록은 전부 주인 것
+- **팀 기록은 30일 보관** — 팀 계정으로 뽑은 기록은 30일이 지나면 전문 파일까지 자동 삭제 (6시간마다 청소). 주인 기록은 안 지워짐
+- **테일스케일에서만** — 로그인을 켜면 테일스케일 대역(`100.64.0.0/10`, `fd7a:115c:a1e0::/48`)과 로컬에서 온 요청만 받음. 같은 공유기 안에서도 열려면 `YT2TEXT_ALLOW_LAN=1`
+- 로그인 시도는 IP당 5분에 10번 제한, 세션은 30일 유지 (서명 키를 `yt2text_data/secret.key`에 보관해서 재시작해도 안 풀림)
+
+비밀번호는 저장소에 넣지 말고 systemd 드롭인으로 넣으세요:
+
+```bash
+sudo mkdir -p /etc/systemd/system/yt2text.service.d
+sudo tee /etc/systemd/system/yt2text.service.d/auth.conf >/dev/null <<'EOF'
+[Service]
+Environment=YT2TEXT_OWNER_PW=주인비번
+Environment=YT2TEXT_TEAM_PW=팀비번
+EOF
+sudo chmod 600 /etc/systemd/system/yt2text.service.d/auth.conf
+sudo systemctl daemon-reload && sudo systemctl restart yt2text
+```
+
+`tailscale serve --bg 8765`로 HTTPS를 붙이면 주소가 `https://<머신>.<tailnet>.ts.net`이 되고, 복사 버튼이 쓰는 클립보드 API도 제대로 동작합니다.
+
 ### 안정성 · 보안
 - Host 헤더 검사 + JSON Content-Type 강제 — 외부 사이트가 로컬 서버를 몰래 조작하는 것(CSRF/DNS 리바인딩) 방어
 - 서버 재시작 시 진행 중이던 작업은 화면에서 실패 처리 (영원히 "진행 중"으로 남지 않음)
@@ -80,6 +103,7 @@ cd YtoTEXT
 
 | 버전 | 내용 |
 |------|------|
+| v4.6 | 계정 2개(주인·팀) 로그인, 계정별 기록 분리, 팀 기록 30일 자동 삭제, 테일스케일 대역만 허용 |
 | v4.5 | 히스토리 정렬 (날짜 / 제목 / 영상 길이) |
 | v4.4 | 히스토리 폴더 (사이드바, 드래그로 정리, 폴더별 보기)와 카드마다 다시 추출 버튼 |
 | v4.3 | 인기 댓글 수집 (인기순 상위 중 좋아요 많은 5개) — 결과 화면 본문 위에 표시하고 AI용 복사에 포함 |
@@ -92,7 +116,7 @@ cd YtoTEXT
 
 ## 참고
 
-- 데이터는 전부 로컬 `yt2text_data/`에 저장됩니다 (목록 `history.json` · 폴더 `folders.json` · 전문 `results/` · 썸네일 `thumbs/`) — git에는 올라가지 않음
+- 데이터는 전부 로컬 `yt2text_data/`에 저장됩니다 (목록 `history.json` · 폴더 `folders.json` · 전문 `results/` · 썸네일 `thumbs/` · 세션 키 `secret.key`) — git에는 올라가지 않음
 - Whisper 모델은 최초 사용 시 자동 다운로드됩니다 (large 계열은 수 GB, 수 분 소요)
 - 기본은 `127.0.0.1` 바인딩 + Host 헤더 검사로 외부/타 사이트 접근을 차단합니다 (`--host`로 바꾸면 검사 자동 해제)
 - 유튜브 차단은 시간이 지나면 풀립니다 — 대량 배치는 몇 개씩 나눠서, 급한 건 Whisper 모드로

@@ -17,19 +17,24 @@ import os
 import re
 import sys
 import glob
+import hmac
 import json
 import random
+import secrets
+import ipaddress
 import subprocess
 import time
 import uuid
 import shutil
 import tempfile
 import threading
+from datetime import timedelta
 from pathlib import Path
 from urllib.request import urlopen
 from urllib.parse import quote
 
-from flask import Flask, request, jsonify, Response, send_file
+from flask import (Flask, request, jsonify, Response, send_file, session,
+                   redirect)
 
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
@@ -50,6 +55,33 @@ def _check_host():
     if ALLOWED_HOSTS and request.host not in ALLOWED_HOSTS:
         return jsonify(error="허용되지 않은 요청이에요."), 403
 
+
+@app.before_request
+def _check_peer():
+    """로그인을 켜면 테일스케일(과 로컬)에서 온 요청만 받음."""
+    if not tailnet_only():
+        return
+    try:
+        ip = ipaddress.ip_address(request.remote_addr or "")
+    except ValueError:
+        return jsonify(error="이 네트워크에서는 접속할 수 없어요."), 403
+    # 루프백은 서버 자신과 `tailscale serve` 프록시가 쓰는 주소
+    if ip.is_loopback or any(ip in net for net in TS_NETS):
+        return
+    return jsonify(error="이 네트워크에서는 접속할 수 없어요."), 403
+
+
+@app.before_request
+def _check_login():
+    if not auth_on() or request.path in ("/login", "/api/login"):
+        return
+    if current_user():
+        return
+    if request.path.startswith(("/api/", "/thumbs/")):
+        return jsonify(error="로그인이 필요해요.", login=True), 401
+    return redirect("/login")
+
+
 PREFERRED = ["ko", "en"]
 HISTORY_MAX = 300
 BATCH_MAX = 50
@@ -60,10 +92,20 @@ TITLE_FIX_MAX = 20   # 제목 복구 한 번에 시도할 항목 수
 TITLE_FIX_COOL = 300  # 복구 실패 시 첫 쿨다운(초). 반복되면 2배씩, 최대 1시간
 FOLDER_MAX = 50      # 폴더 개수 상한
 FOLDER_NAME_MAX = 40  # 폴더 이름 길이 상한
+TEAM_KEEP_DAYS = 30  # 팀 계정 기록 보관 기간 (주인 기록은 안 지움)
+PRUNE_EVERY = 6 * 3600   # 만료된 팀 기록 청소 주기(초)
+SESSION_DAYS = 30    # 로그인 유지 기간
+LOGIN_MAX_TRIES = 10  # IP당 로그인 시도 횟수
+LOGIN_WINDOW = 300   # 시도 횟수가 초기화되는 간격(초)
+
+# 테일스케일 주소 대역 (CGNAT + ULA) — 여기서 온 요청만 받음
+TS_NETS = (ipaddress.ip_network("100.64.0.0/10"),
+           ipaddress.ip_network("fd7a:115c:a1e0::/48"))
 
 DATA_DIR = Path(__file__).resolve().parent / "yt2text_data"
 HISTORY_FILE = DATA_DIR / "history.json"
 FOLDERS_FILE = DATA_DIR / "folders.json"
+SECRET_FILE = DATA_DIR / "secret.key"
 THUMBS_DIR = DATA_DIR / "thumbs"
 RESULTS_DIR = DATA_DIR / "results"
 _hist_lock = threading.Lock()
@@ -85,6 +127,70 @@ VIDEO_ID_RE = re.compile(
     r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|live/|embed/)|^)"
     r"([A-Za-z0-9_-]{11})"
 )
+
+# ---------------------------------------------------------------- 로그인
+#
+# 비밀번호는 환경변수로만 받음 — 저장소가 공개라 코드에 넣으면 안 됨.
+#   YT2TEXT_OWNER_PW  주인 계정 (기록을 영구 보관)
+#   YT2TEXT_TEAM_PW   팀 공용 계정 (기록을 30일 뒤 자동 삭제)
+# 둘 다 비어 있으면 로그인 없이 예전처럼 동작 (혼자 로컬에서 쓸 때).
+
+
+def _users():
+    """설정된 계정만 담아서 반환. {이름: 비밀번호}"""
+    return {name: pw for name, pw in (
+        ("owner", os.environ.get("YT2TEXT_OWNER_PW", "")),
+        ("team", os.environ.get("YT2TEXT_TEAM_PW", "")),
+    ) if pw}
+
+
+def auth_on():
+    return bool(_users())
+
+
+def tailnet_only():
+    """로그인을 켜면 = 남과 공유한다는 뜻이라 테일스케일 밖은 막음.
+    같은 공유기 안에서도 쓰려면 YT2TEXT_ALLOW_LAN=1."""
+    return auth_on() and os.environ.get("YT2TEXT_ALLOW_LAN") != "1"
+
+
+def current_user():
+    """로그인한 계정 이름. 로그인을 안 쓰면 전부 주인 것으로 봄."""
+    return "owner" if not auth_on() else session.get("user")
+
+
+def _secret_key():
+    """세션 서명 키 — 재시작해도 로그인이 풀리지 않게 파일에 보관."""
+    try:
+        key = SECRET_FILE.read_text(encoding="utf-8").strip()
+        if key:
+            return key
+    except Exception:
+        pass
+    key = secrets.token_hex(32)
+    _atomic_write(SECRET_FILE, key)
+    try:
+        os.chmod(SECRET_FILE, 0o600)
+    except OSError:
+        pass
+    return key
+
+
+_login_tries = {}   # IP → [시도 횟수, 창이 열린 시각]
+
+
+def _login_allowed(ip):
+    """4자리 비밀번호라 무차별 대입을 막아둠."""
+    now = time.time()
+    tries, started = _login_tries.get(ip, (0, now))
+    if now - started > LOGIN_WINDOW:
+        tries, started = 0, now
+    if tries >= LOGIN_MAX_TRIES:
+        _login_tries[ip] = (tries, started)
+        return False
+    _login_tries[ip] = (tries + 1, started)
+    return True
+
 
 # ---------------------------------------------------------------- 공통 유틸
 
@@ -179,10 +285,23 @@ def _save_history(entries):
     _atomic_write(HISTORY_FILE, json.dumps(entries, ensure_ascii=False))
 
 
-def _result_path(key: str) -> Path:
-    """항목 키 → 전문 파일 경로 (윈도우 금지 문자 ':'와 경로 탈출 제거)."""
-    fname = key.replace(":", "__").replace("/", "_").replace("\\", "_")
+def _safe_name(s: str) -> str:
+    """윈도우 금지 문자 ':'와 경로 탈출 제거."""
+    return s.replace(":", "__").replace("/", "_").replace("\\", "_")
+
+
+def _result_path(key: str, user: str = "owner") -> Path:
+    """항목 키 → 전문 파일 경로. 계정별로 갈라둬서 같은 영상을 서로 다른
+    사람이 뽑아도 덮어쓰지 않음 (주인 파일명은 예전 그대로)."""
+    fname = _safe_name(key)
+    if user != "owner":
+        fname = _safe_name(user) + "__" + fname
     return RESULTS_DIR / f"{fname}.json"
+
+
+def _owner_of(entry) -> str:
+    """user가 없는 옛 기록은 전부 주인 것."""
+    return entry.get("user") or "owner"
 
 
 def _migrate_history():
@@ -213,7 +332,7 @@ def save_thumb(video_id: str):
         pass
 
 
-def history_add(result):
+def history_add(result, user="owner"):
     key = f"{result['video_id']}:{result['source']}"
     entry = {
         "key": key,
@@ -225,19 +344,62 @@ def history_add(result):
         "duration": result.get("duration"),
         "saved_at": time.strftime("%Y-%m-%d %H:%M"),
     }
+    if user != "owner":
+        entry["user"] = user
+    same = lambda e: e.get("key") == key and _owner_of(e) == user
     with _hist_lock:
-        _atomic_write(_result_path(key), json.dumps(result, ensure_ascii=False))
+        _atomic_write(_result_path(key, user),
+                      json.dumps(result, ensure_ascii=False))
         entries = _load_history()
-        prev = next((e for e in entries if e.get("key") == key), None)
+        prev = next((e for e in entries if same(e)), None)
         if prev and prev.get("folder"):
             entry["folder"] = prev["folder"]  # 다시 추출해도 폴더는 그대로
-        entries = [e for e in entries if e.get("key") != key]
+        entries = [e for e in entries if not same(e)]
         entries.insert(0, entry)
         for old in entries[HISTORY_MAX:]:  # 밀려난 항목은 전문 파일도 정리
-            _result_path(old["key"]).unlink(missing_ok=True)
+            _result_path(old["key"], _owner_of(old)).unlink(missing_ok=True)
         _save_history(entries[:HISTORY_MAX])
     threading.Thread(target=save_thumb,
                      args=(result["video_id"],), daemon=True).start()
+
+
+def _saved_ts(entry):
+    """saved_at → epoch. 못 읽으면 None (그런 항목은 안 지움)."""
+    try:
+        return time.mktime(time.strptime(entry.get("saved_at", ""),
+                                         "%Y-%m-%d %H:%M"))
+    except Exception:
+        return None
+
+
+def prune_expired(now=None):
+    """팀 계정 기록만 TEAM_KEEP_DAYS 지나면 삭제. 주인 기록은 안 건드림."""
+    cutoff = (now or time.time()) - TEAM_KEEP_DAYS * 86400
+    with _hist_lock:
+        entries = _load_history()
+        keep, drop = [], []
+        for e in entries:
+            ts = _saved_ts(e)
+            expired = (_owner_of(e) != "owner" and ts is not None
+                       and ts < cutoff)
+            (drop if expired else keep).append(e)
+        if not drop:
+            return 0
+        for e in drop:
+            _result_path(e["key"], _owner_of(e)).unlink(missing_ok=True)
+        _save_history(keep)
+    print(f"[정리] 팀 기록 {len(drop)}개 삭제 ({TEAM_KEEP_DAYS}일 경과)",
+          file=sys.stderr, flush=True)
+    return len(drop)
+
+
+def _prune_loop():
+    while True:
+        try:
+            prune_expired()
+        except Exception as e:
+            print(f"[정리] 실패: {type(e).__name__}", file=sys.stderr, flush=True)
+        time.sleep(PRUNE_EVERY)
 
 
 _title_fix_running = False
@@ -374,8 +536,9 @@ def _title_fix_cooldown(failed: bool):
 @app.get("/api/history")
 def api_history():
     global _title_fix_running
+    me = current_user()
     with _hist_lock:
-        entries = _load_history()
+        entries = [e for e in _load_history() if _owner_of(e) == me]
     if (not _title_fix_running and _title_fix_until <= time.time()
             and any(e.get("title") == e.get("video_id") for e in entries)):
         _title_fix_running = True
@@ -384,9 +547,14 @@ def api_history():
     return jsonify(slim)
 
 
+@app.get("/api/me")
+def api_me():
+    return jsonify(user=current_user(), auth=auth_on())
+
+
 @app.get("/api/history/<path:key>")
 def api_history_get(key):
-    p = _result_path(key)
+    p = _result_path(key, current_user())
     if p.exists():
         return Response(p.read_text(encoding="utf-8"),
                         mimetype="application/json")
@@ -405,10 +573,14 @@ def api_thumb(vid):
 
 @app.delete("/api/history/<path:key>")
 def api_history_delete(key):
+    me = current_user()
+    mine = lambda e: e.get("key") == key and _owner_of(e) == me
     with _hist_lock:
-        entries = [e for e in _load_history() if e.get("key") != key]
-        _save_history(entries)
-        _result_path(key).unlink(missing_ok=True)
+        entries = _load_history()
+        if not any(mine(e) for e in entries):
+            return jsonify(error="히스토리에 없어요."), 404
+        _save_history([e for e in entries if not mine(e)])
+        _result_path(key, me).unlink(missing_ok=True)
     return jsonify(ok=True)
 
 # ---------------------------------------------------------------- 폴더
@@ -438,8 +610,9 @@ def _json_body():
 
 @app.get("/api/folders")
 def api_folders():
+    me = current_user()
     with _hist_lock:
-        return jsonify(_load_folders())
+        return jsonify([f for f in _load_folders() if _owner_of(f) == me])
 
 
 @app.post("/api/folders")
@@ -450,13 +623,17 @@ def api_folder_add():
     name = _folder_name(data.get("name"))
     if not name:
         return jsonify(error="폴더 이름을 입력해 주세요."), 400
+    me = current_user()
     with _hist_lock:
         items = _load_folders()
-        if len(items) >= FOLDER_MAX:
+        mine = [f for f in items if _owner_of(f) == me]
+        if len(mine) >= FOLDER_MAX:
             return jsonify(error=f"폴더는 {FOLDER_MAX}개까지만 만들 수 있어요."), 400
-        if any(f.get("name") == name for f in items):
+        if any(f.get("name") == name for f in mine):
             return jsonify(error="같은 이름의 폴더가 이미 있어요."), 409
         folder = {"id": uuid.uuid4().hex[:8], "name": name}
+        if me != "owner":
+            folder["user"] = me
         items.append(folder)
         _save_folders(items)
     return jsonify(folder)
@@ -470,12 +647,14 @@ def api_folder_rename(fid):
     name = _folder_name(data.get("name"))
     if not name:
         return jsonify(error="폴더 이름을 입력해 주세요."), 400
+    me = current_user()
     with _hist_lock:
         items = _load_folders()
-        if any(f.get("name") == name and f.get("id") != fid for f in items):
+        mine = [f for f in items if _owner_of(f) == me]
+        if any(f.get("name") == name and f.get("id") != fid for f in mine):
             return jsonify(error="같은 이름의 폴더가 이미 있어요."), 409
         hit = None
-        for f in items:
+        for f in mine:
             if f.get("id") == fid:
                 f["name"] = name
                 hit = f
@@ -488,9 +667,10 @@ def api_folder_rename(fid):
 @app.delete("/api/folders/<fid>")
 def api_folder_delete(fid):
     """폴더만 지우고 안에 있던 항목은 미분류로 — 영상 기록은 안 건드림."""
+    me = current_user()
     with _hist_lock:
         items = _load_folders()
-        if not any(f.get("id") == fid for f in items):
+        if not any(f.get("id") == fid and _owner_of(f) == me for f in items):
             return jsonify(error="없는 폴더예요."), 404
         _save_folders([f for f in items if f.get("id") != fid])
         entries = _load_history()
@@ -508,13 +688,15 @@ def api_history_move(key):
     if data is None:
         return jsonify(error="JSON 요청이 필요해요."), 400
     fid = data.get("folder") or None
+    me = current_user()
     with _hist_lock:
-        if fid and not any(f.get("id") == fid for f in _load_folders()):
+        if fid and not any(f.get("id") == fid and _owner_of(f) == me
+                           for f in _load_folders()):
             return jsonify(error="없는 폴더예요."), 404
         entries = _load_history()
         hit = False
         for e in entries:
-            if e.get("key") == key:
+            if e.get("key") == key and _owner_of(e) == me:
                 hit = True
                 if fid:
                     e["folder"] = fid
@@ -525,6 +707,42 @@ def api_history_move(key):
         _save_history(entries)
     return jsonify(ok=True)
 
+# ---------------------------------------------------------------- 로그인 루트
+
+
+@app.get("/login")
+def login_page():
+    if current_user():
+        return redirect("/")
+    return Response(LOGIN_PAGE, mimetype="text/html")
+
+
+@app.post("/api/login")
+def api_login():
+    data = _json_body()
+    if data is None:
+        return jsonify(error="JSON 요청이 필요해요."), 400
+    if not _login_allowed(request.remote_addr or ""):
+        return jsonify(error="시도가 너무 많아요. 잠시 뒤 다시 해주세요."), 429
+    pw = str(data.get("password") or "")
+    for name, real in _users().items():
+        if hmac.compare_digest(pw, real):
+            session.clear()
+            session["user"] = name
+            session.permanent = True
+            return jsonify(user=name)
+    return jsonify(error="비밀번호가 맞지 않아요."), 401
+
+
+@app.post("/api/logout")
+def api_logout():
+    session.clear()
+    return jsonify(ok=True)
+
+
+app.secret_key = _secret_key()
+app.permanent_session_lifetime = timedelta(days=SESSION_DAYS)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 
 _migrate_history()
 
@@ -596,7 +814,7 @@ def api_transcript():
     res["available"] = available
     res["language_code"] = fetched.language_code
     res["is_generated"] = fetched.is_generated
-    history_add(res)
+    history_add(res, current_user())
     return jsonify(res)
 
 # ---------------------------------------------------------------- STT 루트
@@ -684,7 +902,7 @@ def get_model(name: str, force_cpu=False):
         return model
 
 
-def stt_worker(job_id, url, model_name, language):
+def stt_worker(job_id, url, model_name, language, user="owner"):
     job = JOBS[job_id]
     tmp = Path(tempfile.mkdtemp(prefix="yt2text_"))
 
@@ -802,7 +1020,7 @@ def stt_worker(job_id, url, model_name, language):
         res["channel"] = channel
         res["description"] = info.get("description")
         res["comments"] = comments
-        history_add(res)
+        history_add(res, user)
         job.update(status="done", progress=100, result=res,
                    ended_at=time.time())
 
@@ -834,7 +1052,7 @@ def api_stt():
     job_id = uuid.uuid4().hex[:12]
     JOBS[job_id] = {"status": "running", "phase": "시작", "progress": 0}
     threading.Thread(target=stt_worker,
-                     args=(job_id, url, model_name, language),
+                     args=(job_id, url, model_name, language, current_user()),
                      daemon=True).start()
     return jsonify(job_id=job_id)
 
@@ -865,6 +1083,62 @@ def index():
                     mimetype="text/html")
 
 
+LOGIN_PAGE = r"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yt2text</title>
+<style>
+  :root{ --bg:#20242B; --panel:#2B3038; --accent:#C63B2F; --fg:#FFFFFF;
+    --fg-soft:#9AA0A8;
+    --mono:ui-monospace,'SF Mono','JetBrains Mono',Menlo,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Apple SD Gothic Neo','Pretendard','Noto Sans KR',sans-serif; }
+  *{box-sizing:border-box;margin:0}
+  body{background:var(--bg);font-family:var(--sans);min-height:100vh;display:flex;
+       flex-direction:column;align-items:center;justify-content:center;padding:20px}
+  .brand{font-family:var(--mono);font-size:13px;letter-spacing:.14em;color:var(--fg-soft)}
+  .brand b{color:var(--fg);font-weight:600}
+  form{display:flex;gap:10px;margin-top:22px;width:100%;max-width:340px}
+  input{flex:1;min-width:0;padding:14px 16px;font-size:16px;border:0;border-radius:10px;
+       background:var(--panel);color:var(--fg);font-family:var(--mono);outline:none;
+       text-align:center;letter-spacing:.3em}
+  input:focus{box-shadow:0 0 0 2px var(--accent)}
+  button{padding:14px 22px;font-size:15px;font-weight:600;border:0;border-radius:10px;
+       background:var(--accent);color:#fff;cursor:pointer;font-family:var(--sans)}
+  button:hover{background:#B23328}
+  .err{margin-top:14px;color:#F3A19A;font-size:14px;min-height:20px}
+</style>
+</head>
+<body>
+  <div class="brand"><b>yt2text</b> · local · caption + whisper</div>
+  <form onsubmit="go(event)">
+    <input id="pw" type="password" inputmode="numeric" autocomplete="current-password"
+           placeholder="비밀번호" autofocus>
+    <button type="submit">입장</button>
+  </form>
+  <div class="err" id="err"></div>
+<script>
+async function go(ev){
+  ev.preventDefault();
+  const pw = document.getElementById('pw'), err = document.getElementById('err');
+  err.textContent = '';
+  try{
+    const r = await fetch('/api/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({password: pw.value})
+    });
+    if(r.ok){ location.href = '/'; return; }
+    const j = await r.json().catch(()=>({}));
+    err.textContent = j.error || '로그인에 실패했어요.';
+  }catch(e){ err.textContent = '서버 연결 실패'; }
+  pw.value = ''; pw.focus();
+}
+</script>
+</body>
+</html>
+"""
+
 PAGE = r"""<!doctype html>
 <html lang="ko">
 <head>
@@ -884,8 +1158,17 @@ PAGE = r"""<!doctype html>
   body{background:var(--bg);font-family:var(--sans);min-height:100vh;
        display:flex;flex-direction:column;align-items:center;padding:48px 20px 80px}
   .col{width:100%;max-width:760px}
-  .brand{font-family:var(--mono);font-size:13px;letter-spacing:.14em;color:var(--fg-soft)}
+  .brand{font-family:var(--mono);font-size:13px;letter-spacing:.14em;color:var(--fg-soft);
+       display:flex;align-items:center;gap:10px}
   .brand b{color:var(--fg);font-weight:600}
+  .brand .sp{flex:1}
+  .who{font-family:var(--mono);font-size:11.5px;letter-spacing:0;color:var(--fg-soft);
+       background:var(--panel);border-radius:99px;padding:4px 10px;display:none}
+  .who.show{display:inline-block}
+  .logout{border:0;background:none;color:#5A6068;font-family:var(--sans);font-size:12px;
+       cursor:pointer;letter-spacing:0;padding:4px 2px;display:none}
+  .logout.show{display:inline-block}
+  .logout:hover{color:var(--accent)}
 
   .mode{display:inline-flex;background:var(--panel);border-radius:10px;padding:3px;margin-top:16px}
   .mode button{border:0;background:none;color:var(--fg-soft);font-family:var(--sans);
@@ -1051,7 +1334,12 @@ PAGE = r"""<!doctype html>
 </head>
 <body>
   <div class="col">
-    <div class="brand"><b>yt2text</b> · local · caption + whisper</div>
+    <div class="brand">
+      <span><b>yt2text</b> · local · caption + whisper</span>
+      <span class="sp"></span>
+      <span class="who" id="who"></span>
+      <button class="logout" id="logout" onclick="logout()">로그아웃</button>
+    </div>
 
     <div class="mode" id="mode">
       <button id="m_cap" onclick="setMode('cap')">자막 (빠름)</button>
@@ -1132,6 +1420,7 @@ PAGE = r"""<!doctype html>
 let D = null, HIST = [], ROWS = {}, POLL = null;
 let FOLDERS = [], FOLDER = localStorage.getItem('yt2text_folder') || '';  // '' 전체 · '_none' 미분류
 let SORT = localStorage.getItem('yt2text_sort') || 'new';
+let ME = null;
 const $ = id => document.getElementById(id);
 const IDRE = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|live\/|embed\/)|^)([A-Za-z0-9_-]{11})/;
 const BATCH_MAX = __BATCH_MAX__;
@@ -1432,6 +1721,7 @@ function setSort(v){
 async function loadHistory(){
   try{
     const [hr, fr] = await Promise.all([fetch('/api/history'), fetch('/api/folders')]);
+    if(!gate(hr) || !gate(fr)) return;
     HIST = await hr.json();
     FOLDERS = await fr.json();
     if(FOLDER && FOLDER !== '_none' && !FOLDERS.some(f => f.id === FOLDER)) setFolder('');
@@ -1825,12 +2115,39 @@ function dl(kind){
   a.download = `${name}.${kind}`; a.click(); URL.revokeObjectURL(a.href);
 }
 
+// ------------------------------------------------ 로그인 상태
+async function loadMe(){
+  try{
+    const r = await fetch('/api/me');
+    if(!gate(r)) return;
+    const j = await r.json();
+    ME = j.user;
+    if(j.auth){
+      $('who').textContent = ME === 'owner' ? '주인' : '팀';
+      $('who').classList.add('show');
+      $('logout').classList.add('show');
+    }
+  }catch(e){}
+}
+
+// 세션이 끊기면 로그인 화면으로 — fetch 응답을 이걸로 걸러줌
+function gate(r){
+  if(r.status === 401){ location.href = '/login'; return false; }
+  return true;
+}
+
+async function logout(){
+  try{ await fetch('/api/logout', {method:'POST'}); }catch(e){}
+  location.href = '/login';
+}
+
 // ------------------------------------------------ 초기화
 $('sortsel').value = SORT;
 // 저장된 값이 목록에 없으면 select가 빈칸이 되므로 기본값(최신순)으로 되돌림
 if($('sortsel').selectedIndex < 0) $('sortsel').selectedIndex = 0;
 SORT = $('sortsel').value;
 setMode(getMode());
+loadMe();
 loadHistory();
 </script>
 </body>
@@ -1851,5 +2168,14 @@ if __name__ == "__main__":
         ALLOWED_HOSTS = set()
 
     shown = "localhost" if args.host in ("127.0.0.1", "localhost", "::1") else args.host
-    print(f"\n  yt2text →  http://{shown}:{args.port}\n")
+    print(f"\n  yt2text →  http://{shown}:{args.port}")
+    if auth_on():
+        who = " · ".join(sorted(_users()))
+        where = "테일스케일에서만" if tailnet_only() else "LAN 허용"
+        print(f"  로그인 켜짐 ({who}) · {where} · 팀 기록은 {TEAM_KEEP_DAYS}일 보관")
+        threading.Thread(target=_prune_loop, daemon=True).start()
+    elif args.host not in ("127.0.0.1", "localhost", "::1"):
+        print("  (경고) 로그인이 꺼져 있는데 외부에 열려 있어요 — "
+              "YT2TEXT_OWNER_PW / YT2TEXT_TEAM_PW를 설정하세요")
+    print()
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
