@@ -228,9 +228,9 @@ def history_add(result):
     with _hist_lock:
         _atomic_write(_result_path(key), json.dumps(result, ensure_ascii=False))
         entries = _load_history()
-        old = next((e for e in entries if e.get("key") == key), None)
-        if old and old.get("folder"):
-            entry["folder"] = old["folder"]  # 다시 추출해도 폴더는 그대로
+        prev = next((e for e in entries if e.get("key") == key), None)
+        if prev and prev.get("folder"):
+            entry["folder"] = prev["folder"]  # 다시 추출해도 폴더는 그대로
         entries = [e for e in entries if e.get("key") != key]
         entries.insert(0, entry)
         for old in entries[HISTORY_MAX:]:  # 밀려난 항목은 전문 파일도 정리
@@ -1034,6 +1034,7 @@ PAGE = r"""<!doctype html>
   @media (max-width:820px){
     /* 세로로 쌓일 땐 stretch — flex-start면 그리드가 카드 한 장 너비로 쪼그라듦 */
     .histwrap{flex-direction:column;gap:12px;align-items:stretch}
+    .card .acts{display:flex}   /* 터치엔 hover가 없어서 늘 보여줌 */
     .folders{width:100%;position:static;display:flex;gap:6px;overflow-x:auto;padding-bottom:4px}
     .fitem{flex-shrink:0}
     .fitem .fcnt,.fitem .fx{display:none}
