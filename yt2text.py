@@ -58,9 +58,12 @@ COMMENT_POOL = 30    # 좋아요 순으로 추리려고 인기순 앞에서 긁�
 COMMENT_TIMEOUT = 10  # 댓글 요청 응답 대기 상한(초) — 부가정보라 오래 안 기다림
 TITLE_FIX_MAX = 20   # 제목 복구 한 번에 시도할 항목 수
 TITLE_FIX_COOL = 300  # 복구 실패 시 첫 쿨다운(초). 반복되면 2배씩, 최대 1시간
+FOLDER_MAX = 50      # 폴더 개수 상한
+FOLDER_NAME_MAX = 40  # 폴더 이름 길이 상한
 
 DATA_DIR = Path(__file__).resolve().parent / "yt2text_data"
 HISTORY_FILE = DATA_DIR / "history.json"
+FOLDERS_FILE = DATA_DIR / "folders.json"
 THUMBS_DIR = DATA_DIR / "thumbs"
 RESULTS_DIR = DATA_DIR / "results"
 _hist_lock = threading.Lock()
@@ -224,7 +227,11 @@ def history_add(result):
     }
     with _hist_lock:
         _atomic_write(_result_path(key), json.dumps(result, ensure_ascii=False))
-        entries = [e for e in _load_history() if e.get("key") != key]
+        entries = _load_history()
+        old = next((e for e in entries if e.get("key") == key), None)
+        if old and old.get("folder"):
+            entry["folder"] = old["folder"]  # 다시 추출해도 폴더는 그대로
+        entries = [e for e in entries if e.get("key") != key]
         entries.insert(0, entry)
         for old in entries[HISTORY_MAX:]:  # 밀려난 항목은 전문 파일도 정리
             _result_path(old["key"]).unlink(missing_ok=True)
@@ -402,6 +409,120 @@ def api_history_delete(key):
         entries = [e for e in _load_history() if e.get("key") != key]
         _save_history(entries)
         _result_path(key).unlink(missing_ok=True)
+    return jsonify(ok=True)
+
+# ---------------------------------------------------------------- 폴더
+
+
+def _load_folders():
+    try:
+        return json.loads(FOLDERS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _save_folders(items):
+    _atomic_write(FOLDERS_FILE, json.dumps(items, ensure_ascii=False))
+
+
+def _folder_name(raw):
+    """공백 정리 + 길이 제한. 빈 이름이면 빈 문자열."""
+    return " ".join((raw or "").split())[:FOLDER_NAME_MAX]
+
+
+def _json_body():
+    """JSON 강제 (타 사이트 text/plain 방어). 아니면 None."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else None
+
+
+@app.get("/api/folders")
+def api_folders():
+    with _hist_lock:
+        return jsonify(_load_folders())
+
+
+@app.post("/api/folders")
+def api_folder_add():
+    data = _json_body()
+    if data is None:
+        return jsonify(error="JSON 요청이 필요해요."), 400
+    name = _folder_name(data.get("name"))
+    if not name:
+        return jsonify(error="폴더 이름을 입력해 주세요."), 400
+    with _hist_lock:
+        items = _load_folders()
+        if len(items) >= FOLDER_MAX:
+            return jsonify(error=f"폴더는 {FOLDER_MAX}개까지만 만들 수 있어요."), 400
+        if any(f.get("name") == name for f in items):
+            return jsonify(error="같은 이름의 폴더가 이미 있어요."), 409
+        folder = {"id": uuid.uuid4().hex[:8], "name": name}
+        items.append(folder)
+        _save_folders(items)
+    return jsonify(folder)
+
+
+@app.patch("/api/folders/<fid>")
+def api_folder_rename(fid):
+    data = _json_body()
+    if data is None:
+        return jsonify(error="JSON 요청이 필요해요."), 400
+    name = _folder_name(data.get("name"))
+    if not name:
+        return jsonify(error="폴더 이름을 입력해 주세요."), 400
+    with _hist_lock:
+        items = _load_folders()
+        if any(f.get("name") == name and f.get("id") != fid for f in items):
+            return jsonify(error="같은 이름의 폴더가 이미 있어요."), 409
+        hit = None
+        for f in items:
+            if f.get("id") == fid:
+                f["name"] = name
+                hit = f
+        if not hit:
+            return jsonify(error="없는 폴더예요."), 404
+        _save_folders(items)
+    return jsonify(hit)
+
+
+@app.delete("/api/folders/<fid>")
+def api_folder_delete(fid):
+    """폴더만 지우고 안에 있던 항목은 미분류로 — 영상 기록은 안 건드림."""
+    with _hist_lock:
+        items = _load_folders()
+        if not any(f.get("id") == fid for f in items):
+            return jsonify(error="없는 폴더예요."), 404
+        _save_folders([f for f in items if f.get("id") != fid])
+        entries = _load_history()
+        for e in entries:
+            if e.get("folder") == fid:
+                e.pop("folder", None)
+        _save_history(entries)
+    return jsonify(ok=True)
+
+
+@app.patch("/api/history/<path:key>")
+def api_history_move(key):
+    """항목을 폴더로 옮김. folder가 비어 있으면 미분류로 뺌."""
+    data = _json_body()
+    if data is None:
+        return jsonify(error="JSON 요청이 필요해요."), 400
+    fid = data.get("folder") or None
+    with _hist_lock:
+        if fid and not any(f.get("id") == fid for f in _load_folders()):
+            return jsonify(error="없는 폴더예요."), 404
+        entries = _load_history()
+        hit = False
+        for e in entries:
+            if e.get("key") == key:
+                hit = True
+                if fid:
+                    e["folder"] = fid
+                else:
+                    e.pop("folder", None)
+        if not hit:
+            return jsonify(error="히스토리에 없어요."), 404
+        _save_history(entries)
     return jsonify(ok=True)
 
 
@@ -873,12 +994,53 @@ PAGE = r"""<!doctype html>
   .card .src{display:inline-block;padding:1px 7px;border-radius:99px;margin-right:6px;
        font-size:10.5px;background:#20242B;color:var(--fg-mid)}
   .card .src.w{color:#F0A9A2}
-  .card .del{position:absolute;top:8px;right:8px;width:24px;height:24px;border:0;border-radius:6px;
-       background:rgba(0,0,0,.55);color:#C9CDD3;font-size:14px;line-height:1;cursor:pointer;
-       display:none;align-items:center;justify-content:center}
-  .card:hover .del{display:flex}
-  .card .del:hover{background:var(--accent);color:#fff}
+  .card .acts{position:absolute;top:8px;right:8px;gap:4px;display:none}
+  .card:hover .acts{display:flex}
+  .card .acts button{width:24px;height:24px;border:0;border-radius:6px;
+       background:rgba(0,0,0,.6);color:#C9CDD3;font-size:13px;line-height:1;cursor:pointer;
+       display:flex;align-items:center;justify-content:center;font-family:var(--sans)}
+  .card .acts button:hover{background:var(--accent);color:#fff}
+  .card.dragging{opacity:.4}
   .empty{font-size:13.5px;color:#5A6068;padding:8px 2px}
+
+  .histsec{width:100%;max-width:960px}   /* 히스토리만 사이드바 만큼 더 넓게 */
+  .histwrap{display:flex;gap:20px;align-items:flex-start}
+  .histmain{flex:1;min-width:0}
+  .folders{width:172px;flex-shrink:0;position:sticky;top:20px}
+  .fitem{display:flex;align-items:center;gap:7px;padding:7px 10px;border-radius:8px;
+       cursor:pointer;color:var(--fg-soft);font-size:13px;line-height:1.35}
+  .fitem:hover{background:var(--panel)}
+  .fitem.on{background:var(--panel-hi);color:var(--fg);font-weight:600}
+  .fitem.drop{box-shadow:inset 0 0 0 1.5px var(--accent);background:var(--panel)}
+  .fitem .fname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .fitem .fcnt{font-family:var(--mono);font-size:11px;color:#5A6068;flex-shrink:0}
+  .fitem .fx{display:none;border:0;background:none;color:var(--fg-soft);cursor:pointer;
+       font-size:12px;padding:0 1px;flex-shrink:0;font-family:var(--sans)}
+  .fitem:hover .fx{display:block}
+  .fitem .fx:hover{color:var(--accent)}
+  .fsep{height:1px;background:#343A44;margin:9px 4px}
+  .fadd{width:100%;margin-top:6px;padding:7px 10px;border:1px dashed #3A4048;border-radius:8px;
+       background:none;color:#5A6068;font-size:12.5px;cursor:pointer;text-align:left;
+       font-family:var(--sans)}
+  .fadd:hover{border-color:var(--fg-soft);color:var(--fg-soft)}
+
+  .fmenu{position:fixed;z-index:60;background:var(--panel);border-radius:10px;padding:6px;
+       box-shadow:0 14px 36px rgba(0,0,0,.5);min-width:170px;max-height:60vh;overflow-y:auto}
+  .fmenu button{display:block;width:100%;text-align:left;border:0;background:none;
+       color:var(--fg-mid);font-size:13px;padding:7px 10px;border-radius:6px;cursor:pointer;
+       font-family:var(--sans);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .fmenu button:hover{background:var(--panel-hi);color:var(--fg)}
+  .fmenu button.on{color:var(--accent);font-weight:600}
+  @media (max-width:820px){
+    /* 세로로 쌓일 땐 stretch — flex-start면 그리드가 카드 한 장 너비로 쪼그라듦 */
+    .histwrap{flex-direction:column;gap:12px;align-items:stretch}
+    .folders{width:100%;position:static;display:flex;gap:6px;overflow-x:auto;padding-bottom:4px}
+    .fitem{flex-shrink:0}
+    .fitem .fcnt,.fitem .fx{display:none}
+    .fitem:hover .fx{display:none}
+    .fsep{display:none}
+    .fadd{width:auto;margin-top:0;flex-shrink:0;white-space:nowrap}
+  }
   @media (max-width:560px){ .cover,.tools,.body{padding-left:20px;padding-right:20px} }
 </style>
 </head>
@@ -937,15 +1099,24 @@ PAGE = r"""<!doctype html>
       <div class="body" id="out"></div>
     </div>
 
+  </div>
+
+  <div class="histsec">
     <div class="histhead">
       <span class="lab">HISTORY</span><span class="cnt" id="histcnt"></span>
     </div>
-    <div class="grid" id="grid"></div>
-    <div class="empty" id="empty" style="display:none">아직 추출한 영상이 없어요.</div>
+    <div class="histwrap">
+      <aside class="folders" id="folders"></aside>
+      <div class="histmain">
+        <div class="grid" id="grid"></div>
+        <div class="empty" id="empty" style="display:none">아직 추출한 영상이 없어요.</div>
+      </div>
+    </div>
   </div>
 
 <script>
 let D = null, HIST = [], ROWS = {}, POLL = null;
+let FOLDERS = [], FOLDER = localStorage.getItem('yt2text_folder') || '';  // '' 전체 · '_none' 미분류
 const $ = id => document.getElementById(id);
 const IDRE = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|live\/|embed\/)|^)([A-Za-z0-9_-]{11})/;
 const BATCH_MAX = __BATCH_MAX__;
@@ -1211,21 +1382,40 @@ function ensurePolling(){
 }
 
 // ------------------------------------------------ 히스토리
+function inFolder(e){
+  if(FOLDER === '') return true;              // 전체
+  if(FOLDER === '_none') return !e.folder;    // 미분류
+  return e.folder === FOLDER;
+}
+
 async function loadHistory(){
   try{
-    const r = await fetch('/api/history');
-    HIST = await r.json();
+    const [hr, fr] = await Promise.all([fetch('/api/history'), fetch('/api/folders')]);
+    HIST = await hr.json();
+    FOLDERS = await fr.json();
+    if(FOLDER && FOLDER !== '_none' && !FOLDERS.some(f => f.id === FOLDER)) setFolder('');
+    renderFolders();
+    const shown = HIST.filter(inFolder);
     const grid = $('grid');
     grid.innerHTML = '';
-    $('histcnt').textContent = HIST.length ? HIST.length + '개' : '';
-    $('empty').style.display = HIST.length ? 'none' : 'block';
-    HIST.forEach(e=>{
+    $('histcnt').textContent = !HIST.length ? ''
+      : (FOLDER ? `${shown.length}개 / 전체 ${HIST.length}개` : HIST.length + '개');
+    $('empty').style.display = shown.length ? 'none' : 'block';
+    $('empty').textContent = HIST.length
+      ? '이 폴더엔 아직 없어요 — 카드를 끌어다 넣어보세요.'
+      : '아직 추출한 영상이 없어요.';
+    shown.forEach(e=>{
       const card = document.createElement('div');
       card.className = 'card';
+      card.draggable = true;
       const isW = e.source !== 'caption';
       card.innerHTML = `
         <img loading="lazy" alt="">
-        <button class="del" title="삭제">&times;</button>
+        <div class="acts">
+          <button class="re" title="같은 방식으로 다시 추출">↻</button>
+          <button class="mv" title="폴더로 옮기기">🗂</button>
+          <button class="del" title="삭제">&times;</button>
+        </div>
         <div class="cbody">
           <div class="ctitle"></div>
           <div class="cmeta">
@@ -1243,6 +1433,14 @@ async function loadHistory(){
       card.querySelector('.del').onclick = ev=>{
         ev.stopPropagation(); delHistory(e.key);
       };
+      card.querySelector('.re').onclick = ev=>{ ev.stopPropagation(); reExtract(e); };
+      card.querySelector('.mv').onclick = ev=>{ ev.stopPropagation(); folderMenu(ev, e); };
+      card.ondragstart = ev=>{
+        ev.dataTransfer.setData('text/plain', e.key);
+        ev.dataTransfer.effectAllowed = 'move';
+        card.classList.add('dragging');
+      };
+      card.ondragend = ()=>card.classList.remove('dragging');
       grid.appendChild(card);
     });
     // 제목이 깨진 항목이 있으면 서버가 뒤에서 복구 중 — 잠시 뒤 다시 불러옴
@@ -1264,6 +1462,157 @@ async function openHistory(key){
 async function delHistory(key){
   await fetch('/api/history/' + encodeURIComponent(key), {method:'DELETE'});
   loadHistory();
+}
+
+// ------------------------------------------------ 다시 추출
+function reExtract(e){
+  const vid = e.video_id;
+  const isW = e.source !== 'caption';
+  setMode(isW ? 'stt' : 'cap');       // 원래 뽑았던 방식 그대로
+  if(isW){
+    const model = e.source.split(':')[1];
+    if(model && [...$('model').options].some(o => o.value === model))
+      $('model').value = model;
+  }
+  if(!Object.values(ROWS).some(r => r.busy)){ $('queue').innerHTML = ''; ROWS = {}; }
+  $('queue').classList.add('show');
+  if(!ROWS[vid]){ makeRow(vid, null); startRow(vid); }
+  $('queue').scrollIntoView({behavior:'smooth', block:'center'});
+}
+
+// ------------------------------------------------ 폴더
+function setFolder(id){
+  FOLDER = id;
+  localStorage.setItem('yt2text_folder', id);
+}
+
+function renderFolders(){
+  const box = $('folders');
+  box.innerHTML = '';
+  const none = HIST.filter(e => !e.folder).length;
+  box.appendChild(folderItem('', '전체', HIST.length));
+  box.appendChild(folderItem('_none', '미분류', none));
+  if(FOLDERS.length){
+    const sep = document.createElement('div'); sep.className = 'fsep';
+    box.appendChild(sep);
+  }
+  FOLDERS.forEach(f=>{
+    box.appendChild(folderItem(f.id, f.name,
+      HIST.filter(e => e.folder === f.id).length, f));
+  });
+  const add = document.createElement('button');
+  add.className = 'fadd'; add.textContent = '+ 폴더 추가';
+  add.onclick = addFolder;
+  box.appendChild(add);
+}
+
+function folderItem(id, name, count, f){
+  const el = document.createElement('div');
+  el.className = 'fitem' + (FOLDER === id ? ' on' : '');
+  el.onclick = ()=>{ setFolder(id); loadHistory(); };
+
+  const n = document.createElement('span');
+  n.className = 'fname'; n.textContent = name; n.title = name;
+  const c = document.createElement('span');
+  c.className = 'fcnt'; c.textContent = count;
+  el.append(n, c);
+
+  if(f){  // 사용자가 만든 폴더만 이름 바꾸기 / 삭제
+    const ren = document.createElement('button');
+    ren.className = 'fx'; ren.textContent = '✎'; ren.title = '이름 바꾸기';
+    ren.onclick = ev=>{ ev.stopPropagation(); renameFolder(f); };
+    const del = document.createElement('button');
+    del.className = 'fx'; del.textContent = '×'; del.title = '폴더 삭제';
+    del.onclick = ev=>{ ev.stopPropagation(); delFolder(f); };
+    el.append(ren, del);
+  }
+
+  if(id !== ''){  // '전체'로는 못 옮김
+    el.ondragover = ev=>{ ev.preventDefault(); el.classList.add('drop'); };
+    el.ondragleave = ()=>el.classList.remove('drop');
+    el.ondrop = ev=>{
+      ev.preventDefault(); el.classList.remove('drop');
+      const key = ev.dataTransfer.getData('text/plain');
+      if(key) moveTo(key, id === '_none' ? null : id);
+    };
+  }
+  return el;
+}
+
+async function folderApi(url, opts){
+  try{
+    const r = await fetch(url, opts);
+    if(!r.ok){
+      const j = await r.json().catch(()=>({}));
+      $('err').textContent = j.error || '폴더 작업에 실패했어요.';
+      return null;
+    }
+    $('err').textContent = '';
+    return await r.json();
+  }catch(e){ $('err').textContent = '서버 연결 실패'; return null; }
+}
+
+const jsonPost = (method, body) => ({
+  method, headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+});
+
+async function addFolder(){
+  const name = (prompt('새 폴더 이름') || '').trim();
+  if(!name) return;
+  const f = await folderApi('/api/folders', jsonPost('POST', {name}));
+  if(f){ setFolder(f.id); loadHistory(); }
+}
+
+async function renameFolder(f){
+  const name = (prompt('폴더 이름', f.name) || '').trim();
+  if(!name || name === f.name) return;
+  if(await folderApi('/api/folders/' + f.id, jsonPost('PATCH', {name}))) loadHistory();
+}
+
+async function delFolder(f){
+  if(!confirm(`'${f.name}' 폴더를 지울까요?\n안에 있던 영상은 지워지지 않고 미분류로 가요.`))
+    return;
+  if(await folderApi('/api/folders/' + f.id, {method:'DELETE'})){
+    if(FOLDER === f.id) setFolder('');
+    loadHistory();
+  }
+}
+
+async function moveTo(key, fid){
+  const ok = await folderApi('/api/history/' + encodeURIComponent(key),
+                             jsonPost('PATCH', {folder: fid}));
+  if(ok) loadHistory();
+}
+
+function folderMenu(ev, e){
+  closeMenu();
+  const m = document.createElement('div');
+  m.className = 'fmenu';
+  const pick = (label, fid, on)=>{
+    const b = document.createElement('button');
+    b.textContent = label;
+    if(on) b.classList.add('on');
+    b.onclick = ()=>{ closeMenu(); moveTo(e.key, fid); };
+    m.appendChild(b);
+  };
+  pick('미분류로 빼기', null, !e.folder);
+  FOLDERS.forEach(f => pick(f.name, f.id, e.folder === f.id));
+  if(!FOLDERS.length){
+    const b = document.createElement('button');
+    b.textContent = '+ 폴더 만들기';
+    b.onclick = ()=>{ closeMenu(); addFolder(); };
+    m.appendChild(b);
+  }
+  document.body.appendChild(m);
+  const r = ev.currentTarget.getBoundingClientRect();
+  m.style.top = Math.min(r.bottom + 6, innerHeight - m.offsetHeight - 10) + 'px';
+  m.style.left = Math.min(r.left, innerWidth - m.offsetWidth - 10) + 'px';
+  window._menu = m;
+  setTimeout(()=>document.addEventListener('click', closeMenu, {once:true}), 0);
+}
+
+function closeMenu(){
+  if(window._menu){ window._menu.remove(); window._menu = null; }
 }
 
 // ------------------------------------------------ 결과 표시
