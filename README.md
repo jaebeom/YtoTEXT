@@ -70,6 +70,29 @@ cd YtoTEXT
 - Thumbnails are backed up locally (cards survive even if a video is taken down)
 - Entries whose title couldn't be fetched (blocks, embed-disabled videos) are repaired automatically on a later history load — cheap oembed lookup first, with a yt-dlp fallback for videos it refuses. Repair is deliberately frugal: 20 entries per pass, a pause after every attempt, and a cooldown (5 min, doubling to 1 h) after a failed pass so a still-blocked host isn't hammered on every history reload
 
+### Sharing with a team (optional)
+
+- **Two accounts** — an owner (`YT2TEXT_OWNER_PW`) and a shared team login (`YT2TEXT_TEAM_PW`). Set either environment variable and the login screen turns on; set neither and the app behaves exactly as before
+- **Nothing gets mixed** — history and folders are fully separated per account. Two people can extract the same video without overwriting each other, and neither can open or delete the other's records. Entries without a `user` field (everything from before) belong to the owner
+- **Team records expire after 30 days** — anything extracted on the team login is deleted, transcript file included, once it is 30 days old (swept every 6 hours). Owner records never expire
+- **Tailscale only** — with login on, requests are accepted only from the Tailscale ranges (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) and from the machine itself. Set `YT2TEXT_ALLOW_LAN=1` to also allow your LAN
+- Login attempts are capped at 10 per IP per 5 minutes; sessions last 30 days (the signing key lives in `yt2text_data/secret.key`, so a restart doesn't log everyone out)
+
+Keep passwords out of the repository — use a systemd drop-in:
+
+```bash
+sudo mkdir -p /etc/systemd/system/yt2text.service.d
+sudo tee /etc/systemd/system/yt2text.service.d/auth.conf >/dev/null <<'EOF'
+[Service]
+Environment=YT2TEXT_OWNER_PW=your-owner-pw
+Environment=YT2TEXT_TEAM_PW=your-team-pw
+EOF
+sudo chmod 600 /etc/systemd/system/yt2text.service.d/auth.conf
+sudo systemctl daemon-reload && sudo systemctl restart yt2text
+```
+
+Adding `tailscale serve --bg 8765` puts it behind HTTPS at `https://<machine>.<tailnet>.ts.net`, which also makes the clipboard API work properly.
+
 ### Stability · security
 - Host-header check + JSON Content-Type enforcement — stops other websites from silently driving your local server (CSRF/DNS-rebinding defense)
 - Jobs interrupted by a server restart are surfaced as failed in the UI instead of spinning forever
@@ -79,6 +102,7 @@ cd YtoTEXT
 
 | Version | Notes |
 |---------|-------|
+| v4.6 | Two-account login (owner / team), per-account separation, 30-day expiry for team records, Tailscale-only access |
 | v4.5 | History sorting (date / title / video length) |
 | v4.4 | History folders (sidebar, drag-and-drop filing, per-folder filtering) and a re-extract button on every card |
 | v4.3 | Top comments (5 picked by likes from YouTube's top-ranked candidates) saved with every extraction, shown above the transcript and included in Copy for AI |
@@ -91,7 +115,7 @@ cd YtoTEXT
 
 ## Notes
 
-- All data lives in the local `yt2text_data/` folder (index `history.json` · folders `folders.json` · transcripts `results/` · thumbnails `thumbs/`) — never committed to git
+- All data lives in the local `yt2text_data/` folder (index `history.json` · folders `folders.json` · transcripts `results/` · thumbnails `thumbs/` · session key `secret.key`) — never committed to git
 - Whisper models download automatically on first use (large models are several GB and take a few minutes)
 - Default binding is `127.0.0.1` with a Host-header check that blocks outside/cross-site access (`--host` to change; the check relaxes automatically for non-loopback binds)
 - YouTube blocks are temporary — split large batches into smaller runs, and use Whisper mode for anything urgent
