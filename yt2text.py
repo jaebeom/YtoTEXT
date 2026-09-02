@@ -978,7 +978,11 @@ PAGE = r"""<!doctype html>
   .cmts .ctext{font-size:14px;line-height:1.7;color:var(--ink);margin-top:5px;
        white-space:pre-wrap;word-break:keep-all}
 
-  .histhead{display:flex;align-items:baseline;gap:10px;margin:40px 0 14px}
+  .histhead{display:flex;align-items:center;gap:10px;margin:40px 0 14px}
+  .histhead .hsp{flex:1}
+  .sortsel{padding:6px 10px;border:0;border-radius:8px;background:var(--panel);
+       color:var(--fg-mid);font-family:var(--mono);font-size:12px;outline:none;cursor:pointer}
+  .sortsel:hover{background:var(--panel-hi)}
   .histhead .lab{font-family:var(--mono);font-size:12px;letter-spacing:.16em;color:var(--fg-soft)}
   .histhead .cnt{font-family:var(--mono);font-size:12px;color:#5A6068}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px}
@@ -1105,6 +1109,15 @@ PAGE = r"""<!doctype html>
   <div class="histsec">
     <div class="histhead">
       <span class="lab">HISTORY</span><span class="cnt" id="histcnt"></span>
+      <div class="hsp"></div>
+      <select class="sortsel" id="sortsel" onchange="setSort(this.value)">
+        <option value="new">최신순</option>
+        <option value="old">오래된순</option>
+        <option value="title">제목순</option>
+        <option value="title_desc">제목 역순</option>
+        <option value="long">영상 긴 순</option>
+        <option value="short">영상 짧은 순</option>
+      </select>
     </div>
     <div class="histwrap">
       <aside class="folders" id="folders"></aside>
@@ -1118,6 +1131,7 @@ PAGE = r"""<!doctype html>
 <script>
 let D = null, HIST = [], ROWS = {}, POLL = null;
 let FOLDERS = [], FOLDER = localStorage.getItem('yt2text_folder') || '';  // '' 전체 · '_none' 미분류
+let SORT = localStorage.getItem('yt2text_sort') || 'new';
 const $ = id => document.getElementById(id);
 const IDRE = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|live\/|embed\/)|^)([A-Za-z0-9_-]{11})/;
 const BATCH_MAX = __BATCH_MAX__;
@@ -1389,6 +1403,32 @@ function inFolder(e){
   return e.folder === FOLDER;
 }
 
+function durSec(s){  // "1:10:33" / "17:06" → 초
+  return (s || '').split(':').map(Number).reduce((a, b) => a * 60 + (b || 0), 0);
+}
+
+function sortItems(list){
+  // 서버가 이미 최신순으로 주기 때문에 날짜 정렬은 뒤집기만 하면 됨
+  // (saved_at이 분 단위라 같은 분에 여러 개면 저장 순서가 더 정확함)
+  // 한국어 정렬 규칙 — 한글이 먼저, 그 안에서 가나다순 (영문은 뒤에 A→Z)
+  const byTitle = (a, b) => (a.title || '').localeCompare(b.title || '', 'ko');
+  const byDur = (a, b) => durSec(a.duration) - durSec(b.duration);
+  switch(SORT){
+    case 'old':        return list.slice().reverse();
+    case 'title':      return list.slice().sort(byTitle);
+    case 'title_desc': return list.slice().sort((a, b) => byTitle(b, a));
+    case 'long':       return list.slice().sort((a, b) => byDur(b, a));
+    case 'short':      return list.slice().sort(byDur);
+    default:           return list;   // 최신순
+  }
+}
+
+function setSort(v){
+  SORT = v;
+  localStorage.setItem('yt2text_sort', v);
+  loadHistory();
+}
+
 async function loadHistory(){
   try{
     const [hr, fr] = await Promise.all([fetch('/api/history'), fetch('/api/folders')]);
@@ -1396,7 +1436,7 @@ async function loadHistory(){
     FOLDERS = await fr.json();
     if(FOLDER && FOLDER !== '_none' && !FOLDERS.some(f => f.id === FOLDER)) setFolder('');
     renderFolders();
-    const shown = HIST.filter(inFolder);
+    const shown = sortItems(HIST.filter(inFolder));
     const grid = $('grid');
     grid.innerHTML = '';
     $('histcnt').textContent = !HIST.length ? ''
@@ -1786,6 +1826,10 @@ function dl(kind){
 }
 
 // ------------------------------------------------ 초기화
+$('sortsel').value = SORT;
+// 저장된 값이 목록에 없으면 select가 빈칸이 되므로 기본값(최신순)으로 되돌림
+if($('sortsel').selectedIndex < 0) $('sortsel').selectedIndex = 0;
+SORT = $('sortsel').value;
 setMode(getMode());
 loadHistory();
 </script>
