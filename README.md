@@ -50,7 +50,7 @@ cd YtoTEXT
 
 ### Batch extraction
 - Paste multiple links, one per line (up to 50), with per-row progress
-- **Duplicate detection**: already-extracted videos show a notice row with [Open] / [Re-extract]. If the existing record was pulled the other way, the row says so and the button offers that method by name ([caption으로 추출] / [whisper로 추출]) — captions and Whisper are kept as separate records for the same video
+- **Duplicate detection**: already-extracted videos show a notice row with [Open] / [Re-extract]. If the existing record was pulled the other way, the row says so and the button offers that method by name ([caption으로 추출] / [whisper로 추출]) — captions and Whisper are kept as separate records for the same video. Detection searches the whole history, not the folder you happen to be viewing, so a video filed in another folder (or left unfiled) is still caught — otherwise an out-of-sight record would send a whole Whisper run through again. [Open] opens it wherever it lives, and the card's 🗂 will file it where you want it
 - Adding new links while a batch is running appends to the queue instead of resetting it
 - Videos without captions offer a one-click [Extract with Whisper] switch on the failed row
 
