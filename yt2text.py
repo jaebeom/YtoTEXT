@@ -347,12 +347,18 @@ def history_add(result, user="owner"):
     if user != "owner":
         entry["user"] = user
     same = lambda e: e.get("key") == key and _owner_of(e) == user
+    # 폴더는 키가 아니라 영상에 붙는 걸로 봄 — whisper로 뽑아둔 걸 자막으로
+    # 다시 뽑으면 키가 달라지는데, 그때 폴더를 잃으면 폴더 보기에서 감쪽같이
+    # 사라져 버림 (추출은 됐는데 목록엔 안 뜨는 것처럼 보임)
+    kin = lambda e: (e.get("video_id") == result["video_id"]
+                     and _owner_of(e) == user and e.get("folder"))
     with _hist_lock:
         _atomic_write(_result_path(key, user),
                       json.dumps(result, ensure_ascii=False))
         entries = _load_history()
-        prev = next((e for e in entries if same(e)), None)
-        if prev and prev.get("folder"):
+        prev = (next((e for e in entries if same(e) and e.get("folder")), None)
+                or next((e for e in entries if kin(e)), None))
+        if prev:
             entry["folder"] = prev["folder"]  # 다시 추출해도 폴더는 그대로
         entries = [e for e in entries if not same(e)]
         entries.insert(0, entry)
@@ -1490,11 +1496,17 @@ function makeRow(vid, prev){
 
   if(prev){
     const srcLabel = prev.source === 'caption' ? 'caption' : 'whisper';
-    row.querySelector('.qstat').textContent =
-      `이전에 추출한 기록이 있어요 · ${srcLabel} · ${(prev.saved_at||'').slice(5,16)}`;
+    // 지금 고른 방식이 기록과 다르면 그 얘길 해줘야 함 — "이미 있어요"만
+    // 띄우면 왜 막혔는지 알 수가 없음
+    const want = getMode() === 'stt' ? 'whisper' : 'caption';
+    const diff = srcLabel !== want;
+    const ro = s => s + (s === 'caption' ? '으로' : '로');   // 받침 따라 조사
+    row.querySelector('.qstat').textContent = diff
+      ? `${ro(srcLabel)} 뽑아둔 기록이 있어요 · ${(prev.saved_at||'').slice(5,16)}`
+      : `이전에 추출한 기록이 있어요 · ${srcLabel} · ${(prev.saved_at||'').slice(5,16)}`;
     const acts = row.querySelector('.qacts');
     const openB = btn('열기', 'hot', ()=>openHistory(prev.key));
-    const reB = btn('다시 추출', '', ()=>{
+    const reB = btn(diff ? `${ro(want)} 추출` : '다시 추출', '', ()=>{
       row.classList.remove('dup');
       acts.innerHTML = '';
       startRow(vid);
@@ -1519,7 +1531,7 @@ function rowBar(vid, pct){
   bar.classList.add('show');
   bar.firstElementChild.style.width = pct + '%';
 }
-function rowDone(vid, result){
+async function rowDone(vid, result){
   const r = ROWS[vid];
   r.result = result;
   r.busy = false;
@@ -1529,9 +1541,22 @@ function rowDone(vid, result){
   rowTitle(vid, result.title);
   rowStat(vid, '완료 · 클릭해서 열기');
   r.el.onclick = ()=>{ D = result; show(); };
-  loadHistory();
   // 단독 작업이면 바로 열어줌
   if(Object.keys(ROWS).length === 1){ D = result; show(); }
+  await loadHistory();
+  await fileIntoOpenFolder(result);
+}
+
+// 폴더를 열어둔 채로 뽑으면 그 폴더에 담아줌 — 안 그러면 새로 뽑은 영상이
+// 폴더 필터에 걸려서 목록에 안 나타남
+async function fileIntoOpenFolder(result){
+  if(!FOLDER || FOLDER === '_none') return;
+  const key = result.video_id + ':' + result.source;
+  const e = HIST.find(h => h.key === key);
+  if(!e || e.folder) return;          // 이미 제 폴더가 있으면 거긴 안 건드림
+  await fetch('/api/history/' + encodeURIComponent(key),
+              jsonPost('PATCH', {folder: FOLDER}));
+  loadHistory();
 }
 function rowFail(vid, msg){
   const r = ROWS[vid];

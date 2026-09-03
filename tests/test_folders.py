@@ -167,6 +167,35 @@ class FolderApi(unittest.TestCase):
         self.assertEqual(hist[0]["title"], "새 제목")     # 새로 뽑은 결과로 갱신
         self.assertEqual(hist[0]["folder"], f["id"])      # 폴더는 그대로
 
+    def test_switching_source_keeps_folder(self):
+        """whisper로 뽑아둔 걸 자막으로 다시 뽑아도 같은 폴더에 남아야 함."""
+        _, f = self.add("보관")
+        self.seed_history(self.entry("v1:whisper:small", folder=f["id"]))
+        yt.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+        yt.history_add({"video_id": "v1", "source": "caption", "title": "자막본",
+                        "language": "Korean", "duration": "1:00",
+                        "paragraphs": [], "lines": []})
+
+        hist = self.history()
+        self.assertEqual(len(hist), 2)                    # 방식별로 따로 남음
+        self.assertEqual({e["folder"] for e in hist}, {f["id"]})
+
+    def test_folder_not_borrowed_across_users(self):
+        """남의 기록에 붙은 폴더를 내 추출이 물려받으면 안 됨."""
+        _, f = self.add("보관")
+        self.seed_history(self.entry("v1:whisper:small", folder=f["id"],
+                                     user="team"))
+        yt.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+        yt.history_add({"video_id": "v1", "source": "caption", "title": "내 자막본",
+                        "language": "Korean", "duration": "1:00",
+                        "paragraphs": [], "lines": []})
+
+        mine = [e for e in self.history() if e.get("user") is None]
+        self.assertEqual(len(mine), 1)
+        self.assertNotIn("folder", mine[0])
+
     def test_new_entry_has_no_folder(self):
         yt.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         yt.history_add({"video_id": "v9", "source": "caption", "title": "새 영상",
