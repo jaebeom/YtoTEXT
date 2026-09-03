@@ -1471,7 +1471,10 @@ function go(){
 
   for(const vid of ids){
     if(ROWS[vid]) continue;  // 이미 큐에 있는 영상
-    const prev = HIST.find(h => h.video_id === vid);  // 중복 감지
+    // 중복 감지 — 폴더 필터를 안 거친 전체 기록에서 찾음. 지금 보고 있는
+    // 폴더에 없어도 다른 폴더나 미분류에 있으면 걸림. 일부러 이렇게 둔 거임:
+    // 안 보인다고 없는 셈 치면 Whisper를 통째로 다시 돌리게 됨
+    const prev = HIST.find(h => h.video_id === vid);
     makeRow(vid, prev);
     if(!prev) startRow(vid);
   }
