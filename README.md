@@ -111,16 +111,16 @@ The company intranet (romanty-intranet) checks its own login and forwards reques
 - A request without the right secret header has no identity and gets 401
 - The result view shows a "사내망 문서로 저장" (save as intranet document) link, only in this mode
 - The UI has no inline event attributes (`onclick=` etc.), so the intranet proxy can send a `script-src` with hashes and no `'unsafe-inline'`. Print the hashes with `python yt2text.py --print-csp-hashes` (they don't change with the prefix or other settings)
-- Container: the `Dockerfile` runs `gunicorn 'yt2text:wsgi_app()'` as a non-root user on `127.0.0.1:8765` with one worker and 8 threads (job state lives in memory, so never add workers)
+- Container: the `Dockerfile` runs `gunicorn 'yt2text:wsgi_app()'` as a non-root user on `127.0.0.1:8765` with one worker and 8 threads (job state lives in memory, so never add workers). Data lives in `/data`; the Whisper model cache goes to a separate `/cache` volume (several GB, kept out of backups)
 
 **Moving records over (one-off):** when switching to this mode, this command hands the owner's records to an intranet employee and deletes the team account's records. Run it with the server stopped.
 
 ```bash
 python yt2text.py --migrate-to-employee <employee id>          # dry run — counts only
-python yt2text.py --migrate-to-employee <employee id> --apply  # copies the whole data folder first, then moves
+python yt2text.py --migrate-to-employee <employee id> --apply --backup-dir <where>  # copies the whole data folder first, then moves
 ```
 
-Owner entries and folders get `user: "emp:<id>"` and transcript files are renamed to `emp__<id>__<key>.json`; team entries, folders and transcript files are deleted. It prints how many were moved and deleted, and where the backup is.
+Owner entries and folders get `user: "emp:<id>"` and transcript files are renamed to `emp__<id>__<key>.json`; team entries, folders and transcript files (including orphaned `team__*.json`) are deleted. It prints how many were moved and deleted, and where the backup is. `--backup-dir` must be outside the data folder (on a volume when run in a container). If a target name already exists, the dry run reports it and `--apply` stops before changing anything.
 
 ### Stability · security
 - Host-header check + JSON Content-Type enforcement — stops other websites from silently driving your local server (CSRF/DNS-rebinding defense)

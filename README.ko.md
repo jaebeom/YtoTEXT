@@ -112,16 +112,16 @@ sudo systemctl daemon-reload && sudo systemctl restart yt2text
 - 비밀 헤더가 없거나 틀린 요청은 신원이 없어서 401
 - 결과 화면에 「사내망 문서로 저장」 링크가 이 모드에서만 보여요
 - 화면에 인라인 이벤트 속성(`onclick=` 등)이 없어서, 사내망 프록시가 `script-src` 에 `'unsafe-inline'` 없이 해시만 붙일 수 있어요. 해시는 `python yt2text.py --print-csp-hashes` 로 출력 (접두어·설정이 바뀌어도 해시는 같음)
-- 컨테이너: `Dockerfile` 이 비루트 사용자로 `gunicorn 'yt2text:wsgi_app()'` (워커 1개 + 스레드 8 — 작업 상태가 메모리라 워커를 늘리면 안 됨)를 `127.0.0.1:8765` 에 띄워요
+- 컨테이너: `Dockerfile` 이 비루트 사용자로 `gunicorn 'yt2text:wsgi_app()'` (워커 1개 + 스레드 8 — 작업 상태가 메모리라 워커를 늘리면 안 됨)를 `127.0.0.1:8765` 에 띄워요. 데이터는 `/data`, Whisper 모델 캐시는 `/cache` 볼륨(수 GB 라 백업 대상과 나눔)
 
 **기록 옮기기 (한 번만):** 이 모드로 넘어갈 때 주인 기록을 사내망 직원으로 옮기고 팀 기록을 지우는 명령이에요. 서버를 끈 상태에서 돌려요.
 
 ```bash
 python yt2text.py --migrate-to-employee <직원 id>          # 미리보기 — 셀 수만 셈
-python yt2text.py --migrate-to-employee <직원 id> --apply  # 실행 — 데이터 폴더를 통째로 복사해 두고 옮김
+python yt2text.py --migrate-to-employee <직원 id> --apply --backup-dir <백업 둘 곳>  # 실행 — 데이터 폴더를 통째로 복사해 두고 옮김
 ```
 
-주인 기록·폴더에 `user: "emp:<id>"` 를 넣고 전문 파일 이름을 `emp__<id>__<키>.json` 으로 바꿔요. 팀 계정 기록·폴더·전문 파일은 지워요. 옮긴 수와 지운 수, 백업 위치를 출력해요.
+주인 기록·폴더에 `user: "emp:<id>"` 를 넣고 전문 파일 이름을 `emp__<id>__<키>.json` 으로 바꿔요. 팀 계정 기록·폴더·전문 파일(기록 없이 남은 `team__*.json` 포함)은 지워요. 옮긴 수와 지운 수, 백업 위치를 출력해요. `--backup-dir` 는 데이터 폴더 밖이어야 하고 컨테이너 안이면 볼륨 위 경로여야 해요. 옮길 이름이 이미 있으면 미리보기가 그 수를 알려 주고, 실행은 아무것도 바꾸기 전에 멈춰요.
 
 ### 안정성 · 보안
 - Host 헤더 검사 + JSON Content-Type 강제 — 외부 사이트가 로컬 서버를 몰래 조작하는 것(CSRF/DNS 리바인딩) 방어

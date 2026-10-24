@@ -266,6 +266,22 @@ class MembersIsolated(Base):
         self.assertEqual((a["title"], b["title"]), ("제목", "고친 제목"))
 
 
+class ThumbsAndBootstrap(Base):
+    def test_thumbnail_only_for_my_own_videos(self):
+        yt.THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+        (yt.THUMBS_DIR / f"{VID}.jpg").write_bytes(b"jpg")
+        yt.history_add(self.result(), "emp:1")
+        self.assertEqual(self.c.get(f"/thumbs/{VID}.jpg", headers=emp(1)).status_code, 200)
+        self.assertEqual(self.c.get(f"/thumbs/{VID}.jpg", headers=emp(2)).status_code, 404)
+
+    def test_page_knows_proxy_mode_from_the_start(self):
+        html = self.c.get("/", headers=emp(1)).get_data(as_text=True)
+        self.assertIn('<meta name="ytot-proxy-save" content="/ytot-save">', html)
+        os.environ.pop("INTRANET_PROXY_SECRET_FILE")
+        html = self.c.get("/").get_data(as_text=True)
+        self.assertIn('<meta name="ytot-proxy-save" content="">', html)
+
+
 class SsrfAndModels(Base):
     def test_only_canonical_watch_url_reaches_worker(self):
         for raw in (f"http://10.0.0.5/?x=youtu.be/{VID}",
@@ -432,7 +448,7 @@ class Migrate(Base):
         hist = yt.HISTORY_FILE.read_text(encoding="utf-8")
         counts = yt.migrate_to_employee("1")
         self.assertEqual({k: v for k, v in counts.items() if k != "backup"},
-                         dict(history=3, folders=1, files=2, files_missing=1,
+                         dict(history=3, folders=1, files=2, files_missing=1, collisions=0,
                               team_history=1, team_folders=1, team_files=1))
         self.assertIsNone(counts["backup"])
         self.assertEqual(sorted(p.name for p in yt.RESULTS_DIR.iterdir()), before)
@@ -441,7 +457,7 @@ class Migrate(Base):
 
     def test_apply_moves_owner_and_drops_team(self):
         k1, k2 = self.seed()
-        counts = yt.migrate_to_employee("1", apply=True)
+        counts = yt.migrate_to_employee("1", apply=True, backup_dir=self.tmp / "backups")
         self.assertEqual((counts["history"], counts["folders"], counts["files"],
                           counts["team_history"], counts["team_folders"], counts["team_files"]),
                          (3, 1, 2, 1, 1, 1))
@@ -468,8 +484,43 @@ class Migrate(Base):
         self.assertEqual(self.c.get("/api/history/" + k2, headers=emp(5)).get_json()["title"],
                          "직원5 전문")
         # 다시 돌려도 더 옮길 것이 없음
-        again = yt.migrate_to_employee("1", apply=True)
+        again = yt.migrate_to_employee("1", apply=True, backup_dir=self.tmp / "backups")
         self.assertEqual((again["history"], again["files"], again["team_history"]), (0, 0, 0))
+
+    def test_apply_needs_backup_dir_outside_data(self):
+        self.seed()
+        with self.assertRaises(ValueError):
+            yt.migrate_to_employee("1", apply=True)
+        with self.assertRaises(ValueError):
+            yt.migrate_to_employee("1", apply=True, backup_dir=self.data / "inside")
+        self.assertIsNone(yt._load_history()[0].get("user"))  # 아무것도 안 바뀜
+
+    def test_orphan_team_files_go_but_owner_file_named_team_stays(self):
+        self.seed()
+        orphan = yt.RESULTS_DIR / "team__orphanvid01__caption.json"
+        orphan.write_text("{}", encoding="utf-8")
+        # 영상 id 가 team__ 로 시작하는 주인 기록 (11자 id 로 가능)
+        e = yt._load_history()
+        e.append({"key": "team__abcde:caption", "video_id": "team__abcde", "title": "주인 3"})
+        yt._save_history(e)
+        owner_file = yt._result_path("team__abcde:caption")
+        owner_file.write_text(json.dumps({"title": "주인 전문 3"}), encoding="utf-8")
+        counts = yt.migrate_to_employee("1")
+        self.assertEqual(counts["team_files"], 2)  # 기록 있는 팀 파일 1 + 기록 없는 것 1
+        yt.migrate_to_employee("1", apply=True, backup_dir=self.tmp / "backups")
+        self.assertFalse(orphan.exists())
+        self.assertTrue(yt._result_path("team__abcde:caption", "emp:1").exists())  # 주인 파일은 옮겨짐
+
+    def test_collision_is_reported_and_stops_before_any_change(self):
+        k1, _ = self.seed()
+        yt._result_path(k1, "emp:1").write_text("{}", encoding="utf-8")
+        before = sorted(p.name for p in yt.RESULTS_DIR.iterdir())
+        self.assertEqual(yt.migrate_to_employee("1")["collisions"], 1)
+        with self.assertRaises(SystemExit):
+            yt.migrate_to_employee("1", apply=True, backup_dir=self.tmp / "backups")
+        self.assertEqual(sorted(p.name for p in yt.RESULTS_DIR.iterdir()), before)
+        self.assertFalse((self.tmp / "backups").exists())
+        self.assertIsNone(yt._load_history()[0].get("user"))
 
     def test_rejects_bad_employee_id(self):
         for bad in ("0", "abc", "1;rm", ""):

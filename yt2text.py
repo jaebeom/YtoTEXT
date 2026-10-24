@@ -695,6 +695,12 @@ def api_history_get(key):
 def api_thumb(vid):
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}\.jpg", vid):
         return ("", 404)
+    me = current_user()
+    with _hist_lock:  # 썸네일은 같이 쓰는 파일이라, 내 기록에 있는 영상만 내줌
+        mine = any(e.get("video_id") == vid[:-4] and _owner_of(e) == me
+                   for e in _load_history())
+    if not mine:
+        return ("", 404)
     p = THUMBS_DIR / vid
     if p.exists() and p.stat().st_size > 0:
         return send_file(p, mimetype="image/jpeg")
@@ -1226,7 +1232,8 @@ def _page(html):
     """화면 HTML 에 경로 접두어·배치 상한을 meta 로 넣음. 스크립트 본문에는 값을
     안 넣어서 인라인 스크립트 해시가 설정과 상관없이 늘 같음 (사내망 CSP 용)."""
     return (html.replace("__BASE_PATH__", base_path())
-                .replace("__BATCH_MAX__", str(BATCH_MAX)))
+                .replace("__BATCH_MAX__", str(BATCH_MAX))
+                .replace("__PROXY_SAVE__", save_path() if proxy_on() else ""))
 
 
 @app.get("/")
@@ -1316,6 +1323,7 @@ PAGE = r"""<!doctype html>
 <title>yt2text</title>
 <meta name="ytot-base" content="__BASE_PATH__">
 <meta name="ytot-batch-max" content="__BATCH_MAX__">
+<meta name="ytot-proxy-save" content="__PROXY_SAVE__">
 <style>
   :root{
     --bg:#20242B; --panel:#2B3038; --panel-hi:#343A44;
@@ -1592,11 +1600,14 @@ PAGE = r"""<!doctype html>
 let D = null, HIST = [], ROWS = {}, POLL = null;
 let FOLDERS = [], FOLDER = localStorage.getItem('yt2text_folder') || '';  // '' 전체 · '_none' 미분류
 let SORT = localStorage.getItem('yt2text_sort') || 'new';
-let ME = null, PROXY = null;   // PROXY: 사내망 신뢰 프록시 모드면 {save_path}
+let ME = null;
 const $ = id => document.getElementById(id);
 // 경로 접두어 (사내망 아래 /apps/ytot 같은 곳에서 열릴 때) — 서버가 meta 로 넣어줌.
 // 스크립트 본문엔 값을 안 넣어서 사내망 CSP 의 스크립트 해시가 안 바뀜
 const B = document.querySelector('meta[name="ytot-base"]').content;
+// 사내망 신뢰 프록시 모드면 「사내망 문서로 저장」 경로 — 처음부터 알아야 401 을 /login 으로 안 보냄
+const PROXY_SAVE = document.querySelector('meta[name="ytot-proxy-save"]').content;
+const PROXY = PROXY_SAVE ? {save_path: PROXY_SAVE} : null;
 const IDRE = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|live\/|embed\/)|^)([A-Za-z0-9_-]{11})/;
 const BATCH_MAX = Number(document.querySelector('meta[name="ytot-batch-max"]').content);
 
@@ -2322,10 +2333,7 @@ async function loadMe(){
     if(!gate(r)) return;
     const j = await r.json();
     ME = j.user;
-    if(j.proxy){  // 사내망 아래 — 로그인·로그아웃은 사내망이 함
-      PROXY = {save_path: j.save_path};
-      if(D) show();
-    }else if(j.auth){
+    if(!j.proxy && j.auth){  // 사내망 아래면 로그인·로그아웃은 사내망이 함
       $('who').textContent = ME === 'owner' ? '주인' : '팀';
       $('who').classList.add('show');
       $('logout').classList.add('show');
@@ -2416,19 +2424,24 @@ def wsgi_app():
 # ---------------------------------------------------------------- 기록 옮기기 (일회성)
 
 
-def migrate_to_employee(employee_id, apply=False, backup_root=None):
+def migrate_to_employee(employee_id, apply=False, backup_dir=None):
     """사내망 신뢰 프록시 모드로 옮길 때 한 번 돌리는 명령.
 
     - 주인(owner) 기록은 어디에도 user 칸이 없고 전문 파일 이름에 접두어도
       없어서, 기록·폴더에 user="emp:<id>" 를 넣고 전문 파일 이름을 바꿈.
     - 팀 계정 기록·폴더·전문 파일은 지움 (누가 남긴 건지 몰라서 안 옮김).
     - 기본은 미리보기 — 아무것도 안 바꾸고 셀 수만 셈. apply=True 면 데이터
-      폴더를 통째로 복사해 둔 뒤 바꿈. 서버를 끈 상태에서 돌려야 해요.
+      폴더를 backup_dir 아래에 통째로 복사해 둔 뒤 바꿈(backup_dir 필수 — 컨테이너
+      안이면 볼륨 위 경로여야 백업이 남음). 서버를 끈 상태에서 돌려야 해요.
+    - 옮길 이름(emp__<id>__<키>.json)이 이미 있으면 미리보기에서 세어 알려 주고,
+      실행은 아무것도 바꾸기 전에 멈춤(반쪽만 옮겨지는 일 없음).
+    - 기록 없이 남은 팀 전문 파일(team__*.json)도 지움 — 단 주인 기록이 가리키는
+      파일(영상 id 가 team__ 로 시작하는 경우)은 건드리지 않음.
     """
     if not EMPLOYEE_ID_RE.fullmatch(str(employee_id)):
         raise ValueError("직원 id 는 양의 정수예요.")
     me = f"emp:{employee_id}"
-    counts = dict(history=0, folders=0, files=0, files_missing=0,
+    counts = dict(history=0, folders=0, files=0, files_missing=0, collisions=0,
                   team_history=0, team_folders=0, team_files=0, backup=None)
     with _hist_lock:
         entries, folders = _load_history(), _load_folders()
@@ -2447,20 +2460,34 @@ def migrate_to_employee(employee_id, apply=False, backup_root=None):
                 p = _result_path(e["key"], "team")
                 if p.exists():
                     deletes.append(p)
+        # 기록 없이 남은 팀 파일 — 주인 기록이 가리키는 이름은 빼고
+        owner_files = {_result_path(e["key"]).name for e in entries if e.get("user") is None}
+        listed = {p.name for p in deletes}
+        if RESULTS_DIR.exists():
+            for p in sorted(RESULTS_DIR.glob("team__*.json")):
+                if p.name not in owner_files and p.name not in listed:
+                    deletes.append(p)
+        collisions = [dst for _, dst in renames if dst.exists()]
         counts["files"] = len(renames)
+        counts["collisions"] = len(collisions)
         counts["team_files"] = len(deletes)
         counts["folders"] = sum(1 for f in folders if f.get("user") is None)
         counts["team_folders"] = sum(1 for f in folders if f.get("user") == "team")
         if not apply:
             return counts
+        if collisions:  # 바꾸기 전에 멈춤 — 백업도 안 만듦
+            raise SystemExit(f"옮길 이름이 이미 있는 파일 {len(collisions)}개 — 아무것도 안 바꿨어요: "
+                             + ", ".join(p.name for p in collisions[:5]))
+        if not backup_dir:
+            raise ValueError("--apply 에는 --backup-dir 가 필요해요 (데이터 폴더 밖, 볼륨 위 경로).")
         data_dir = HISTORY_FILE.parent
         stamp = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
-        backup = Path(backup_root or data_dir.parent) / f"{data_dir.name}.before-migrate-{stamp}"
+        backup = Path(backup_dir) / f"{data_dir.name}.before-migrate-{stamp}"
+        if backup.resolve().is_relative_to(data_dir.resolve()):
+            raise ValueError("백업 폴더는 데이터 폴더 밖이어야 해요.")
         shutil.copytree(data_dir, backup)
         counts["backup"] = str(backup)
         for src, dst in renames:
-            if dst.exists():
-                raise SystemExit(f"이미 있는 파일이라 멈췄어요: {dst} (백업: {backup})")
             os.replace(src, dst)
         for p in deletes:
             p.unlink(missing_ok=True)
@@ -2488,6 +2515,8 @@ def _print_migrate(counts, employee_id, apply):
     print(f"[옮기기] 주인 기록 → emp:{employee_id} · {head}")
     print(f"  기록 {counts['history']}개 · 폴더 {counts['folders']}개 · "
           f"전문 파일 {counts['files']}개 (파일 없는 기록 {counts['files_missing']}개)")
+    if counts["collisions"]:
+        print(f"  (멈춤) 옮길 이름이 이미 있는 파일 {counts['collisions']}개 — 먼저 확인하세요")
     print(f"  팀 기록 지움 {counts['team_history']}개 · 팀 폴더 {counts['team_folders']}개 · "
           f"팀 전문 파일 {counts['team_files']}개")
     if counts.get("backup"):
@@ -2506,13 +2535,15 @@ if __name__ == "__main__":
                          "(기본은 미리보기, 서버를 끄고 실행)")
     ap.add_argument("--apply", action="store_true",
                     help="--migrate-to-employee 를 실제로 실행 (데이터 폴더를 먼저 복사)")
+    ap.add_argument("--backup-dir", metavar="DIR",
+                    help="--apply 때 데이터 폴더를 통째로 복사해 둘 곳 (필수, 데이터 폴더 밖)")
     args = ap.parse_args()
 
     if args.print_csp_hashes:
         print(json.dumps(inline_hashes(), ensure_ascii=False, indent=2))
         sys.exit(0)
     if args.migrate_to_employee:
-        _print_migrate(migrate_to_employee(args.migrate_to_employee, args.apply),
+        _print_migrate(migrate_to_employee(args.migrate_to_employee, args.apply, args.backup_dir),
                        args.migrate_to_employee, args.apply)
         sys.exit(0)
     problems = check_config()
