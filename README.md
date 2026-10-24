@@ -62,7 +62,7 @@ cd YtoTEXT
 - **YouTube ↗** link on every result; with timestamps on, each timestamp is a link that opens the video at that exact moment
 
 ### History
-- Stores up to 300 extractions locally — thumbnail card grid, click to reopen, per-item delete
+- Stores up to 300 extractions per person (counted per account/employee, so someone else's pulls never push yours out) — thumbnail card grid, click to reopen, per-item delete
 - **Folders** — a sidebar beside the grid. Create folders by theme and file videos into them by dragging a card onto a folder or picking one from the card's 🗂 button. Clicking a folder filters the grid, and the folder you were last in is remembered across reloads. A folder belongs to the video, not to one extraction: pull the same video again — even by a different method — and it stays where you filed it. Extract a new video while a folder is open and it lands in that folder, so a fresh pull never disappears behind the filter. Deleting a folder never deletes videos — they simply go back to *미분류* (unfiled)
 - **Re-extract from a card** — the ↻ button re-runs that video exactly the way it was pulled the first time (captions, or the same Whisper model), queues it like any other job, and replaces that history entry while keeping its folder
 - **Sorting** — newest / oldest, by title (Korean collation: Hangul first, then Latin) or reversed, and by video length either way. It applies within the folder you're viewing and is remembered across reloads
@@ -93,15 +93,47 @@ sudo systemctl daemon-reload && sudo systemctl restart yt2text
 
 Adding `tailscale serve --bg 8765` puts it behind HTTPS at `https://<machine>.<tailnet>.ts.net`, which also makes the clipboard API work properly.
 
+### Running behind the company intranet (trusted proxy mode, optional)
+
+The company intranet (romanty-intranet) checks its own login and forwards requests here. It is switched on by an environment variable; without it, everything above (solo use, team accounts) works exactly as before.
+
+| Name | Kind | Meaning |
+|------|------|---------|
+| `INTRANET_PROXY_SECRET_FILE` | env var | Path to a secret shared only by the intranet and this server (32+ chars). Setting it turns the mode on. If the file can't be read or is too short the server refuses to start |
+| `X-Intranet-Proxy-Secret` | request header | The secret, added by the intranet — compared in constant time against the file |
+| `X-Intranet-Employee-Id` | request header | Intranet employee id (positive integer). Trusted only when the secret matches; becomes user `emp:<id>` |
+| `YT2TEXT_BASE_PATH` | env var | Path prefix (e.g. `/apps/ytot`). Requests outside it get 404; every path and redirect in the UI carries it |
+| `YT2TEXT_SAVE_PATH` | env var | Intranet page opened by the "save as intranet document" link (default `/ytot-save`, plus `?key=<entry key>`) |
+| `YT2TEXT_DATA_DIR` | env var | Data folder (default `yt2text_data/` next to the code) |
+
+- The header and variable names deliberately leave out the tool's name — other tools attached to the intranet use the same contract
+- In this mode password login, `/login` and the app's own session cookie are off (those paths return 404), and the 30-day team expiry is disabled — each member owns their records and deletes them themselves
+- A request without the right secret header has no identity and gets 401
+- The result view shows a "사내망 문서로 저장" (save as intranet document) link, only in this mode
+- The UI has no inline event attributes (`onclick=` etc.), so the intranet proxy can send a `script-src` with hashes and no `'unsafe-inline'`. Print the hashes with `python yt2text.py --print-csp-hashes` (they don't change with the prefix or other settings)
+- Container: the `Dockerfile` runs `gunicorn 'yt2text:wsgi_app()'` as a non-root user on `127.0.0.1:8765` with one worker and 8 threads (job state lives in memory, so never add workers). Data lives in `/data`; the Whisper model cache goes to a separate `/cache` volume (several GB, kept out of backups)
+
+**Moving records over (one-off):** when switching to this mode, this command hands the owner's records to an intranet employee and deletes the team account's records. Run it with the server stopped.
+
+```bash
+python yt2text.py --migrate-to-employee <employee id>          # dry run — counts only
+python yt2text.py --migrate-to-employee <employee id> --apply --backup-dir <where>  # copies the whole data folder first, then moves
+```
+
+Owner entries and folders get `user: "emp:<id>"` and transcript files are renamed to `emp__<id>__<key>.json`; team entries, folders and transcript files (including orphaned `team__*.json`) are deleted. It prints how many were moved and deleted, and where the backup is. `--backup-dir` must be outside the data folder (on a volume when run in a container). If a target name already exists, the dry run reports it and `--apply` stops before changing anything.
+
 ### Stability · security
 - Host-header check + JSON Content-Type enforcement — stops other websites from silently driving your local server (CSRF/DNS-rebinding defense)
 - Jobs interrupted by a server restart are surfaced as failed in the UI instead of spinning forever
 - Finished transcription jobs are pruned from memory after 10 minutes
+- Whisper jobs never pass the submitted link to yt-dlp — only `https://www.youtube.com/watch?v=<id>` rebuilt from the extracted video id (no arbitrary-URL fetches) — and the model must be one of the four offered in the UI
+- Only the person who started a transcription job can poll or cancel it
 
 ## Version history
 
 | Version | Notes |
 |---------|-------|
+| v4.7 | Intranet trusted proxy mode (secret header + employee id), path prefix, CSP-ready UI (no inline event attributes), record migration command, per-person history cap, Whisper URL/model restrictions, job-owner checks, Dockerfile (gunicorn, non-root) |
 | v4.6.1 | Folders follow the video across extraction methods; new pulls land in the folder you're viewing |
 | v4.6 | Two-account login (owner / team), per-account separation, 30-day expiry for team records, Tailscale-only access |
 | v4.5 | History sorting (date / title / video length) |

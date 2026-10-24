@@ -1,0 +1,8 @@
+.git
+.venv
+venv
+__pycache__
+yt2text_data
+tests
+docs
+*.md
