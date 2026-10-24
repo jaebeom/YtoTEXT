@@ -34,7 +34,7 @@ from urllib.request import urlopen
 from urllib.parse import quote
 
 from flask import (Flask, request, jsonify, Response, send_file, session,
-                   redirect)
+                   redirect, g)
 
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
@@ -58,8 +58,9 @@ def _check_host():
 
 @app.before_request
 def _check_peer():
-    """로그인을 켜면 테일스케일(과 로컬)에서 온 요청만 받음."""
-    if not tailnet_only():
+    """로그인을 켜면 테일스케일(과 로컬)에서 온 요청만 받음.
+    신뢰 프록시 모드는 비밀 헤더가 문지기라 여기서는 안 봄."""
+    if proxy_on() or not tailnet_only():
         return
     try:
         ip = ipaddress.ip_address(request.remote_addr or "")
@@ -73,13 +74,24 @@ def _check_peer():
 
 @app.before_request
 def _check_login():
+    # 경로 접두어(YT2TEXT_BASE_PATH)는 _BasePath 가 떼어 SCRIPT_NAME 으로 옮겨서
+    # 여기 request.path 는 접두어 뺀 경로 — 접두어 밖 요청은 거기서 이미 404
+    if proxy_on():
+        if request.path in PASSWORD_PATHS:
+            return jsonify(error="사내망에서는 비밀번호 로그인을 안 써요."), 404
+        if current_user():
+            return
+        if request.path.startswith(("/api/", "/thumbs/")):
+            return jsonify(error="사내망 로그인이 필요해요."), 401
+        return Response("사내망을 거쳐서 열어 주세요.", status=401,
+                        mimetype="text/plain")
     if not auth_on() or request.path in ("/login", "/api/login"):
         return
     if current_user():
         return
     if request.path.startswith(("/api/", "/thumbs/")):
         return jsonify(error="로그인이 필요해요.", login=True), 401
-    return redirect("/login")
+    return redirect(base_path() + "/login")
 
 
 PREFERRED = ["ko", "en"]
@@ -102,7 +114,9 @@ LOGIN_WINDOW = 300   # 시도 횟수가 초기화되는 간격(초)
 TS_NETS = (ipaddress.ip_network("100.64.0.0/10"),
            ipaddress.ip_network("fd7a:115c:a1e0::/48"))
 
-DATA_DIR = Path(__file__).resolve().parent / "yt2text_data"
+# 컨테이너에서는 데이터 볼륨 경로를 환경변수로 넘김 (기본은 예전처럼 코드 옆)
+DATA_DIR = Path(os.environ.get("YT2TEXT_DATA_DIR")
+                or Path(__file__).resolve().parent / "yt2text_data")
 HISTORY_FILE = DATA_DIR / "history.json"
 FOLDERS_FILE = DATA_DIR / "folders.json"
 SECRET_FILE = DATA_DIR / "secret.key"
@@ -127,6 +141,102 @@ VIDEO_ID_RE = re.compile(
     r"(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|live/|embed/)|^)"
     r"([A-Za-z0-9_-]{11})"
 )
+
+# 받아쓰기에 쓸 수 있는 Whisper 모델 — 화면의 선택지와 같음. 목록 밖 이름은
+# faster-whisper 가 임의 저장소·로컬 경로로 읽으려 들 수 있어서 막음
+WHISPER_MODELS = ("large-v3-turbo", "large-v3", "medium", "small")
+
+# ---------------------------------------------------------------- 사내망 신뢰 프록시 모드
+#
+# 사내망 앱이 자기 로그인을 확인한 뒤 요청을 이 서버로 넘겨주는 방식.
+# 도구 이름이 안 들어간 공통 이름이라 다른 사내 도구도 같은 계약을 씀.
+#   INTRANET_PROXY_SECRET_FILE  비밀값 파일 경로 — 설정하면 이 모드가 켜짐
+#   X-Intranet-Proxy-Secret     사내망이 붙이는 비밀값 (파일 내용과 상수 시간 비교)
+#   X-Intranet-Employee-Id      사내망 직원 id (양의 정수) → 사용자 "emp:<id>"
+# 이 모드에서는 비밀번호 로그인·/login·자체 세션 쿠키를 안 쓰고, 팀 기록 30일
+# 만료도 끔 (개인 기록은 본인이 지움). 모드를 끄면 예전 동작 그대로.
+
+PROXY_SECRET_ENV = "INTRANET_PROXY_SECRET_FILE"
+PROXY_SECRET_HEADER = "X-Intranet-Proxy-Secret"
+PROXY_EMPLOYEE_HEADER = "X-Intranet-Employee-Id"
+PROXY_SECRET_MIN = 32           # 비밀값 최소 길이 — 짧으면 모드는 켜진 채 전부 거부
+EMPLOYEE_ID_RE = re.compile(r"[1-9][0-9]{0,9}")
+PASSWORD_PATHS = ("/login", "/api/login", "/api/logout")
+SAVE_PATH_DEFAULT = "/ytot-save"   # 「사내망 문서로 저장」 화면 (접두어 밖, 사내망 쪽)
+BASE_PATH_RE = re.compile(r"(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)+")  # . · .. 칸은 안 됨
+
+
+def proxy_on():
+    return bool(os.environ.get(PROXY_SECRET_ENV))
+
+
+def _proxy_secret():
+    """비밀값 파일 내용. 못 읽거나 너무 짧으면 None — 그때는 아무도 못 들어옴."""
+    try:
+        s = Path(os.environ[PROXY_SECRET_ENV]).read_text(encoding="utf-8").strip()
+    except (KeyError, OSError, UnicodeDecodeError):
+        return None
+    return s if len(s) >= PROXY_SECRET_MIN else None
+
+
+def _proxy_user():
+    """비밀 헤더가 맞을 때만 직원 id 헤더를 믿음. 아니면 None.
+    요청마다 한 번만 확인하고 g 에 담아 둠."""
+    if "proxy_user" not in g:
+        g.proxy_user = _check_proxy_headers()
+    return g.proxy_user
+
+
+def _check_proxy_headers():
+    real = _proxy_secret()
+    got = request.headers.get(PROXY_SECRET_HEADER, "")
+    if not real or not hmac.compare_digest(got.encode("utf-8"),
+                                           real.encode("utf-8")):
+        return None
+    emp = request.headers.get(PROXY_EMPLOYEE_HEADER, "")
+    return f"emp:{emp}" if EMPLOYEE_ID_RE.fullmatch(emp) else None
+
+
+def base_path():
+    """경로 접두어 (예: /apps/ytot). 비었거나 형식이 틀리면 ''.
+    형식이 틀린 값은 시작할 때 막으니까 여기선 조용히 무시."""
+    p = (os.environ.get("YT2TEXT_BASE_PATH") or "").rstrip("/")
+    return p if BASE_PATH_RE.fullmatch(p) else ""
+
+
+def save_path():
+    p = os.environ.get("YT2TEXT_SAVE_PATH") or SAVE_PATH_DEFAULT
+    return p if BASE_PATH_RE.fullmatch(p) else SAVE_PATH_DEFAULT
+
+
+class _BasePath:
+    """접두어 아래로 온 요청만 받아서 접두어를 SCRIPT_NAME 으로 옮김.
+    접두어 밖 요청은 404 — 사내망 프록시가 넘겨준 경로만 앱에 닿게."""
+
+    def __init__(self, wsgi):
+        self.wsgi = wsgi
+
+    def __call__(self, environ, start_response):
+        base = base_path()
+        if not base:
+            return self.wsgi(environ, start_response)
+        path = environ.get("PATH_INFO", "")
+        if path == base:
+            start_response("308 Permanent Redirect",
+                           [("Location", base + "/"), ("Content-Length", "0")])
+            return [b""]
+        if not path.startswith(base + "/"):
+            body = "없는 경로예요.".encode("utf-8")
+            start_response("404 Not Found",
+                           [("Content-Type", "text/plain; charset=utf-8"),
+                            ("Content-Length", str(len(body)))])
+            return [body]
+        environ["SCRIPT_NAME"] = environ.get("SCRIPT_NAME", "") + base
+        environ["PATH_INFO"] = path[len(base):]
+        return self.wsgi(environ, start_response)
+
+
+app.wsgi_app = _BasePath(app.wsgi_app)
 
 # ---------------------------------------------------------------- 로그인
 #
@@ -155,7 +265,10 @@ def tailnet_only():
 
 
 def current_user():
-    """로그인한 계정 이름. 로그인을 안 쓰면 전부 주인 것으로 봄."""
+    """로그인한 계정 이름. 로그인을 안 쓰면 전부 주인 것으로 봄.
+    신뢰 프록시 모드면 비밀번호·세션은 안 보고 사내망이 넘긴 직원만."""
+    if proxy_on():
+        return _proxy_user()
     return "owner" if not auth_on() else session.get("user")
 
 
@@ -346,7 +459,8 @@ def history_add(result, user="owner"):
     }
     if user != "owner":
         entry["user"] = user
-    same = lambda e: e.get("key") == key and _owner_of(e) == user
+    mine = lambda e: _owner_of(e) == user
+    same = lambda e: e.get("key") == key and mine(e)
     # 폴더는 키가 아니라 영상에 붙는 걸로 봄 — whisper로 뽑아둔 걸 자막으로
     # 다시 뽑으면 키가 달라지는데, 그때 폴더를 잃으면 폴더 보기에서 감쪽같이
     # 사라져 버림 (추출은 됐는데 목록엔 안 뜨는 것처럼 보임)
@@ -362,9 +476,12 @@ def history_add(result, user="owner"):
             entry["folder"] = prev["folder"]  # 다시 추출해도 폴더는 그대로
         entries = [e for e in entries if not same(e)]
         entries.insert(0, entry)
-        for old in entries[HISTORY_MAX:]:  # 밀려난 항목은 전문 파일도 정리
-            _result_path(old["key"], _owner_of(old)).unlink(missing_ok=True)
-        _save_history(entries[:HISTORY_MAX])
+        # 상한은 사람마다 따로 셈 — 전체 합계로 세면 남이 뽑을 때 내 기록이 밀림
+        drop = [e for e in entries if mine(e)][HISTORY_MAX:]
+        for old in drop:  # 밀려난 항목은 전문 파일도 정리
+            _result_path(old["key"], user).unlink(missing_ok=True)
+        dropped = {id(e) for e in drop}
+        _save_history([e for e in entries if id(e) not in dropped])
     threading.Thread(target=save_thumb,
                      args=(result["video_id"],), daemon=True).start()
 
@@ -379,7 +496,10 @@ def _saved_ts(entry):
 
 
 def prune_expired(now=None):
-    """팀 계정 기록만 TEAM_KEEP_DAYS 지나면 삭제. 주인 기록은 안 건드림."""
+    """팀 계정 기록만 TEAM_KEEP_DAYS 지나면 삭제. 주인 기록은 안 건드림.
+    신뢰 프록시 모드에선 안 지움 — 구성원마다 자기 기록이라 본인이 지움."""
+    if proxy_on():
+        return 0
     cutoff = (now or time.time()) - TEAM_KEEP_DAYS * 86400
     with _hist_lock:
         entries = _load_history()
@@ -500,13 +620,14 @@ def _fix_missing_titles():
             if not meta.get("title"):
                 continue  # 아직 차단 중이면 다음 기회에
             fixed += 1
+            who = _owner_of(e)  # 같은 키라도 사람마다 따로 — 그 사람 것만 고침
             with _hist_lock:
                 entries = _load_history()
                 for x in entries:
-                    if x.get("key") == e["key"]:
+                    if x.get("key") == e["key"] and _owner_of(x) == who:
                         x["title"] = meta["title"]
                 _save_history(entries)
-                p = _result_path(e["key"])  # 전문 파일 제목·채널도 같이
+                p = _result_path(e["key"], who)  # 전문 파일 제목·채널도 같이
                 try:
                     res = json.loads(p.read_text(encoding="utf-8"))
                     res["title"] = meta["title"]
@@ -555,7 +676,10 @@ def api_history():
 
 @app.get("/api/me")
 def api_me():
-    return jsonify(user=current_user(), auth=auth_on())
+    if proxy_on():  # 화면이 로그아웃 단추를 숨기고 「사내망 문서로 저장」을 보이게
+        return jsonify(user=current_user(), auth=True, proxy=True,
+                       save_path=save_path())
+    return jsonify(user=current_user(), auth=auth_on(), proxy=False)
 
 
 @app.get("/api/history/<path:key>")
@@ -678,10 +802,11 @@ def api_folder_delete(fid):
         items = _load_folders()
         if not any(f.get("id") == fid and _owner_of(f) == me for f in items):
             return jsonify(error="없는 폴더예요."), 404
-        _save_folders([f for f in items if f.get("id") != fid])
+        _save_folders([f for f in items
+                       if not (f.get("id") == fid and _owner_of(f) == me)])
         entries = _load_history()
-        for e in entries:
-            if e.get("folder") == fid:
+        for e in entries:  # 내 항목만 풀어줌 (폴더 id 가 겹쳐도 남의 건 안 건드림)
+            if e.get("folder") == fid and _owner_of(e) == me:
                 e.pop("folder", None)
         _save_history(entries)
     return jsonify(ok=True)
@@ -719,8 +844,8 @@ def api_history_move(key):
 @app.get("/login")
 def login_page():
     if current_user():
-        return redirect("/")
-    return Response(LOGIN_PAGE, mimetype="text/html")
+        return redirect(base_path() + "/")
+    return Response(_page(LOGIN_PAGE), mimetype="text/html")
 
 
 @app.post("/api/login")
@@ -1048,34 +1173,48 @@ def api_stt():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify(error="JSON 요청이 필요해요."), 400
-    url = data.get("url", "")
-    model_name = data.get("model", "large-v3-turbo")
+    model_name = data.get("model") or "large-v3-turbo"
     language = data.get("language") or None
 
-    if not extract_video_id(url):
+    video_id = extract_video_id(str(data.get("url") or ""))
+    if not video_id:
         return jsonify(error="유튜브 링크를 인식하지 못했어요."), 400
+    if model_name not in WHISPER_MODELS:
+        return jsonify(error="지원하지 않는 모델이에요."), 400
+    # 받은 문자열을 그대로 yt-dlp 에 넘기면 'http://내부주소/?x=youtu.be/<11자>'
+    # 같은 걸로 아무 주소나 부를 수 있음 — 뽑아낸 영상 ID 로 주소를 새로 만듦
+    url = f"https://www.youtube.com/watch?v={video_id}"
 
     job_id = uuid.uuid4().hex[:12]
-    JOBS[job_id] = {"status": "running", "phase": "시작", "progress": 0}
+    JOBS[job_id] = {"status": "running", "phase": "시작", "progress": 0,
+                    "user": current_user()}
     threading.Thread(target=stt_worker,
                      args=(job_id, url, model_name, language, current_user()),
                      daemon=True).start()
     return jsonify(job_id=job_id)
 
 
+def _my_job(job_id):
+    """내가 등록한 작업만 — 남의 작업 id 를 알아도 없는 작업과 똑같이 보임."""
+    job = JOBS.get(job_id or "")
+    return job if job and job.get("user") == current_user() else None
+
+
 @app.get("/api/stt/status")
 def api_stt_status():
     _prune_jobs()
-    job = JOBS.get(request.args.get("id", ""))
+    job = _my_job(request.args.get("id", ""))
     if not job:
         return jsonify(error="작업을 찾을 수 없어요."), 404
-    return jsonify(job)
+    return jsonify({k: v for k, v in job.items() if k != "user"})
 
 
 @app.post("/api/stt/cancel")
 def api_stt_cancel():
-    data = request.get_json(silent=True) or {}
-    job = JOBS.get(data.get("id", ""))
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="JSON 요청이 필요해요."), 400
+    job = _my_job(str(data.get("id") or ""))
     if not job:
         return jsonify(error="작업을 찾을 수 없어요."), 404
     job["cancel"] = True
@@ -1083,10 +1222,31 @@ def api_stt_cancel():
 
 # ---------------------------------------------------------------- 페이지
 
+def _page(html):
+    """화면 HTML 에 경로 접두어·배치 상한을 meta 로 넣음. 스크립트 본문에는 값을
+    안 넣어서 인라인 스크립트 해시가 설정과 상관없이 늘 같음 (사내망 CSP 용)."""
+    return (html.replace("__BASE_PATH__", base_path())
+                .replace("__BATCH_MAX__", str(BATCH_MAX)))
+
+
 @app.get("/")
 def index():
-    return Response(PAGE.replace("__BATCH_MAX__", str(BATCH_MAX)),
-                    mimetype="text/html")
+    return Response(_page(PAGE), mimetype="text/html")
+
+
+def inline_hashes():
+    """화면별 인라인 <script>·<style> 의 CSP 해시 ('sha256-…').
+    사내망 프록시가 script-src·style-src 에 'unsafe-inline' 없이 붙일 값."""
+    import base64
+    import hashlib
+    out = {}
+    for name, html in (("PAGE", PAGE), ("LOGIN_PAGE", LOGIN_PAGE)):
+        for tag in ("script", "style"):
+            for body in re.findall(rf"<{tag}>(.*?)</{tag}>", html, re.S):
+                digest = hashlib.sha256(body.encode("utf-8")).digest()
+                out.setdefault(name, {}).setdefault(tag, []).append(
+                    "'sha256-" + base64.b64encode(digest).decode() + "'")
+    return out
 
 
 LOGIN_PAGE = r"""<!doctype html>
@@ -1095,6 +1255,7 @@ LOGIN_PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>yt2text</title>
+<meta name="ytot-base" content="__BASE_PATH__">
 <style>
   :root{ --bg:#20242B; --panel:#2B3038; --accent:#C63B2F; --fg:#FFFFFF;
     --fg-soft:#9AA0A8;
@@ -1118,28 +1279,30 @@ LOGIN_PAGE = r"""<!doctype html>
 </head>
 <body>
   <div class="brand"><b>yt2text</b> · local · caption + whisper</div>
-  <form onsubmit="go(event)">
+  <form id="loginform">
     <input id="pw" type="password" inputmode="numeric" autocomplete="current-password"
            placeholder="비밀번호" autofocus>
     <button type="submit">입장</button>
   </form>
   <div class="err" id="err"></div>
 <script>
+const B = document.querySelector('meta[name="ytot-base"]').content;
 async function go(ev){
   ev.preventDefault();
   const pw = document.getElementById('pw'), err = document.getElementById('err');
   err.textContent = '';
   try{
-    const r = await fetch('/api/login', {
+    const r = await fetch(B + '/api/login', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({password: pw.value})
     });
-    if(r.ok){ location.href = '/'; return; }
+    if(r.ok){ location.href = B + '/'; return; }
     const j = await r.json().catch(()=>({}));
     err.textContent = j.error || '로그인에 실패했어요.';
   }catch(e){ err.textContent = '서버 연결 실패'; }
   pw.value = ''; pw.focus();
 }
+document.getElementById('loginform').addEventListener('submit', go);
 </script>
 </body>
 </html>
@@ -1151,6 +1314,8 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>yt2text</title>
+<meta name="ytot-base" content="__BASE_PATH__">
+<meta name="ytot-batch-max" content="__BATCH_MAX__">
 <style>
   :root{
     --bg:#20242B; --panel:#2B3038; --panel-hi:#343A44;
@@ -1295,6 +1460,8 @@ PAGE = r"""<!doctype html>
   .card .acts button:hover{background:var(--accent);color:#fff}
   .card.dragging{opacity:.4}
   .empty{font-size:13.5px;color:#5A6068;padding:8px 2px}
+  #empty,#stopall{display:none}
+  a.tbtn{text-decoration:none;display:inline-flex;align-items:center}
 
   .histsec{width:100%;max-width:960px}   /* 히스토리만 사이드바 만큼 더 넓게 */
   .histwrap{display:flex;gap:20px;align-items:flex-start}
@@ -1344,19 +1511,18 @@ PAGE = r"""<!doctype html>
       <span><b>yt2text</b> · local · caption + whisper</span>
       <span class="sp"></span>
       <span class="who" id="who"></span>
-      <button class="logout" id="logout" onclick="logout()">로그아웃</button>
+      <button class="logout" id="logout">로그아웃</button>
     </div>
 
     <div class="mode" id="mode">
-      <button id="m_cap" onclick="setMode('cap')">자막 (빠름)</button>
-      <button id="m_stt" onclick="setMode('stt')">Whisper (정확)</button>
+      <button id="m_cap">자막 (빠름)</button>
+      <button id="m_stt">Whisper (정확)</button>
     </div>
 
     <div class="inbar">
       <textarea id="url" rows="1" placeholder="https://www.youtube.com/watch?v=..."
-        autofocus oninput="growBox(this)"
-        onkeydown="if(event.key==='Enter'&&(event.metaKey||event.ctrlKey)){event.preventDefault();go();}"></textarea>
-      <button class="btn" id="gobtn" onclick="go()">추출</button>
+        autofocus></textarea>
+      <button class="btn" id="gobtn">추출</button>
     </div>
     <div class="hint">여러 개는 줄바꿈으로 구분 (최대 __BATCH_MAX__개) · ⌘/Ctrl+Enter로 추출</div>
 
@@ -1374,8 +1540,7 @@ PAGE = r"""<!doctype html>
       </select>
     </div>
     <div class="err" id="err"></div>
-    <button class="qbtn" id="stopall" style="display:none"
-      onclick="stopAllRetries()">차단 재시도 전체 중지</button>
+    <button class="qbtn" id="stopall">차단 재시도 전체 중지</button>
 
     <div class="queue" id="queue"></div>
 
@@ -1385,15 +1550,16 @@ PAGE = r"""<!doctype html>
         <div class="meta" id="meta"></div>
       </div>
       <div class="tools">
-        <label><input type="checkbox" id="tsbox" onchange="render()"> 타임스탬프</label>
+        <label><input type="checkbox" id="tsbox"> 타임스탬프</label>
         <div class="sp"></div>
-        <button class="tbtn" id="copybtn" data-label="복사" onclick="copyText()">복사</button>
+        <a class="tbtn" id="savebtn" hidden
+          title="이 결과를 사내망 문서로 저장하는 화면을 열어요">사내망 문서로 저장</a>
+        <button class="tbtn" id="copybtn" data-label="복사">복사</button>
         <button class="tbtn" id="aicopybtn" data-label="AI용 복사"
-          title="제목·채널·길이·URL·설명·인기 댓글을 머리말로 붙여서 복사 — AI에 바로 붙여넣기 좋게"
-          onclick="copyAI()">AI용 복사</button>
-        <button class="tbtn" onclick="dl('txt')">.txt</button>
-        <button class="tbtn" onclick="dl('md')">.md</button>
-        <button class="tbtn" onclick="dl('srt')">.srt</button>
+          title="제목·채널·길이·URL·설명·인기 댓글을 머리말로 붙여서 복사 — AI에 바로 붙여넣기 좋게">AI용 복사</button>
+        <button class="tbtn" data-dl="txt">.txt</button>
+        <button class="tbtn" data-dl="md">.md</button>
+        <button class="tbtn" data-dl="srt">.srt</button>
       </div>
       <div class="body" id="out"></div>
     </div>
@@ -1404,7 +1570,7 @@ PAGE = r"""<!doctype html>
     <div class="histhead">
       <span class="lab">HISTORY</span><span class="cnt" id="histcnt"></span>
       <div class="hsp"></div>
-      <select class="sortsel" id="sortsel" onchange="setSort(this.value)">
+      <select class="sortsel" id="sortsel">
         <option value="new">최신순</option>
         <option value="old">오래된순</option>
         <option value="title">제목순</option>
@@ -1417,7 +1583,7 @@ PAGE = r"""<!doctype html>
       <aside class="folders" id="folders"></aside>
       <div class="histmain">
         <div class="grid" id="grid"></div>
-        <div class="empty" id="empty" style="display:none">아직 추출한 영상이 없어요.</div>
+        <div class="empty" id="empty">아직 추출한 영상이 없어요.</div>
       </div>
     </div>
   </div>
@@ -1426,10 +1592,13 @@ PAGE = r"""<!doctype html>
 let D = null, HIST = [], ROWS = {}, POLL = null;
 let FOLDERS = [], FOLDER = localStorage.getItem('yt2text_folder') || '';  // '' 전체 · '_none' 미분류
 let SORT = localStorage.getItem('yt2text_sort') || 'new';
-let ME = null;
+let ME = null, PROXY = null;   // PROXY: 사내망 신뢰 프록시 모드면 {save_path}
 const $ = id => document.getElementById(id);
+// 경로 접두어 (사내망 아래 /apps/ytot 같은 곳에서 열릴 때) — 서버가 meta 로 넣어줌.
+// 스크립트 본문엔 값을 안 넣어서 사내망 CSP 의 스크립트 해시가 안 바뀜
+const B = document.querySelector('meta[name="ytot-base"]').content;
 const IDRE = /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|live\/|embed\/)|^)([A-Za-z0-9_-]{11})/;
-const BATCH_MAX = __BATCH_MAX__;
+const BATCH_MAX = Number(document.querySelector('meta[name="ytot-batch-max"]').content);
 
 function growBox(el){
   el.style.height = 'auto';
@@ -1492,7 +1661,7 @@ function makeRow(vid, prev){
     </div>
     <div class="qacts"></div>`;
   const img = row.querySelector('img');
-  img.src = '/thumbs/' + vid + '.jpg';
+  img.src = B + '/thumbs/' + vid + '.jpg';
   img.onerror = ()=>{ img.onerror = null;
     img.src = 'https://i.ytimg.com/vi/' + vid + '/mqdefault.jpg'; };
   row.querySelector('.qtitle').textContent = prev ? prev.title : vid;
@@ -1557,7 +1726,7 @@ async function fileIntoOpenFolder(result){
   const key = result.video_id + ':' + result.source;
   const e = HIST.find(h => h.key === key);
   if(!e || e.folder) return;          // 이미 제 폴더가 있으면 거긴 안 건드림
-  await fetch('/api/history/' + encodeURIComponent(key),
+  await fetch(B + '/api/history/' + encodeURIComponent(key),
               jsonPost('PATCH', {folder: FOLDER}));
   loadHistory();
 }
@@ -1614,7 +1783,7 @@ async function runCaption(vid, lang, attempt){
   ROWS[vid].busy = true;
   rowStat(vid, '자막 추출 중...');
   try{
-    const r = await fetch('/api/transcript', {
+    const r = await fetch(B + '/api/transcript', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({url: vid, lang: lang || null})
     });
@@ -1650,7 +1819,7 @@ async function runStt(vid){
   ROWS[vid].busy = true;
   rowStat(vid, '작업 등록 중...');
   try{
-    const r = await fetch('/api/stt', {
+    const r = await fetch(B + '/api/stt', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
         url: vid,
@@ -1673,7 +1842,7 @@ async function cancelStt(vid){
   if(!id) return;
   rowStat(vid, '취소하는 중...');
   try{
-    await fetch('/api/stt/cancel', {
+    await fetch(B + '/api/stt/cancel', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({id})
     });
@@ -1689,7 +1858,7 @@ function ensurePolling(){
       if(!row.jobId || row.result || row.el.classList.contains('fail')) continue;
       active = true;
       try{
-        const r = await fetch('/api/stt/status?id=' + row.jobId);
+        const r = await fetch(B + '/api/stt/status?id=' + row.jobId);
         const j = await r.json();
         if(!r.ok){  // 서버 재시작 등으로 작업이 사라진 경우
           row.jobId = null;
@@ -1748,7 +1917,7 @@ function setSort(v){
 
 async function loadHistory(){
   try{
-    const [hr, fr] = await Promise.all([fetch('/api/history'), fetch('/api/folders')]);
+    const [hr, fr] = await Promise.all([fetch(B + '/api/history'), fetch(B + '/api/folders')]);
     if(!gate(hr) || !gate(fr)) return;
     HIST = await hr.json();
     FOLDERS = await fr.json();
@@ -1783,7 +1952,7 @@ async function loadHistory(){
           </div>
         </div>`;
       const img = card.querySelector('img');
-      img.src = '/thumbs/' + e.video_id + '.jpg';
+      img.src = B + '/thumbs/' + e.video_id + '.jpg';
       img.onerror = ()=>{ img.onerror = null; img.src = e.thumb; };
       card.querySelector('.ctitle').textContent = e.title;
       card.querySelector('.dur').textContent = e.duration || '';
@@ -1812,14 +1981,14 @@ async function loadHistory(){
 }
 
 async function openHistory(key){
-  const r = await fetch('/api/history/' + encodeURIComponent(key));
+  const r = await fetch(B + '/api/history/' + encodeURIComponent(key));
   if(!r.ok) return;
   D = await r.json(); show();
   $('sheet').scrollIntoView({behavior:'smooth', block:'start'});
 }
 
 async function delHistory(key){
-  await fetch('/api/history/' + encodeURIComponent(key), {method:'DELETE'});
+  await fetch(B + '/api/history/' + encodeURIComponent(key), {method:'DELETE'});
   loadHistory();
 }
 
@@ -1918,27 +2087,27 @@ const jsonPost = (method, body) => ({
 async function addFolder(){
   const name = (prompt('새 폴더 이름') || '').trim();
   if(!name) return;
-  const f = await folderApi('/api/folders', jsonPost('POST', {name}));
+  const f = await folderApi(B + '/api/folders', jsonPost('POST', {name}));
   if(f){ setFolder(f.id); loadHistory(); }
 }
 
 async function renameFolder(f){
   const name = (prompt('폴더 이름', f.name) || '').trim();
   if(!name || name === f.name) return;
-  if(await folderApi('/api/folders/' + f.id, jsonPost('PATCH', {name}))) loadHistory();
+  if(await folderApi(B + '/api/folders/' + f.id, jsonPost('PATCH', {name}))) loadHistory();
 }
 
 async function delFolder(f){
   if(!confirm(`'${f.name}' 폴더를 지울까요?\n안에 있던 영상은 지워지지 않고 미분류로 가요.`))
     return;
-  if(await folderApi('/api/folders/' + f.id, {method:'DELETE'})){
+  if(await folderApi(B + '/api/folders/' + f.id, {method:'DELETE'})){
     if(FOLDER === f.id) setFolder('');
     loadHistory();
   }
 }
 
 async function moveTo(key, fid){
-  const ok = await folderApi('/api/history/' + encodeURIComponent(key),
+  const ok = await folderApi(B + '/api/history/' + encodeURIComponent(key),
                              jsonPost('PATCH', {folder: fid}));
   if(ok) loadHistory();
 }
@@ -1994,11 +2163,14 @@ function show(){
     meta.appendChild(chip(D.source));
     meta.appendChild(chip('감지 언어: ' + D.language));
   }
+  const save = $('savebtn');  // 사내망 아래에서만 — 저장은 사내망 화면이 함
+  save.hidden = !PROXY;
+  if(PROXY) save.href = PROXY.save_path + '?key=' + encodeURIComponent(D.video_id + ':' + D.source);
   render();
 }
 
 async function recap(vid, lang){
-  const r = await fetch('/api/transcript', {
+  const r = await fetch(B + '/api/transcript', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({url: vid, lang})
   });
@@ -2146,11 +2318,14 @@ function dl(kind){
 // ------------------------------------------------ 로그인 상태
 async function loadMe(){
   try{
-    const r = await fetch('/api/me');
+    const r = await fetch(B + '/api/me');
     if(!gate(r)) return;
     const j = await r.json();
     ME = j.user;
-    if(j.auth){
+    if(j.proxy){  // 사내망 아래 — 로그인·로그아웃은 사내망이 함
+      PROXY = {save_path: j.save_path};
+      if(D) show();
+    }else if(j.auth){
       $('who').textContent = ME === 'owner' ? '주인' : '팀';
       $('who').classList.add('show');
       $('logout').classList.add('show');
@@ -2160,16 +2335,37 @@ async function loadMe(){
 
 // 세션이 끊기면 로그인 화면으로 — fetch 응답을 이걸로 걸러줌
 function gate(r){
-  if(r.status === 401){ location.href = '/login'; return false; }
+  if(r.status === 401){
+    // 사내망 아래에서는 로그인 화면이 따로 없음 — 사내망 로그인이 풀린 것
+    if(PROXY){ $('err').textContent = '사내망 로그인이 풀렸어요 — 새로고침해 주세요.'; return false; }
+    location.href = B + '/login'; return false;
+  }
   return true;
 }
 
 async function logout(){
-  try{ await fetch('/api/logout', {method:'POST'}); }catch(e){}
-  location.href = '/login';
+  try{ await fetch(B + '/api/logout', {method:'POST'}); }catch(e){}
+  location.href = B + '/login';
 }
 
 // ------------------------------------------------ 초기화
+// 화면 요소의 이벤트는 여기서 붙임 — 인라인 onclick= 은 사내망 CSP 가 막음
+$('logout').addEventListener('click', logout);
+$('m_cap').addEventListener('click', ()=>setMode('cap'));
+$('m_stt').addEventListener('click', ()=>setMode('stt'));
+$('url').addEventListener('input', ev=>growBox(ev.target));
+$('url').addEventListener('keydown', ev=>{
+  if(ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)){ ev.preventDefault(); go(); }
+});
+$('gobtn').addEventListener('click', ()=>go());
+$('stopall').addEventListener('click', stopAllRetries);
+$('tsbox').addEventListener('change', ()=>render());
+$('copybtn').addEventListener('click', copyText);
+$('aicopybtn').addEventListener('click', copyAI);
+document.querySelectorAll('[data-dl]').forEach(b=>
+  b.addEventListener('click', ()=>dl(b.dataset.dl)));
+$('sortsel').addEventListener('change', ev=>setSort(ev.target.value));
+
 $('sortsel').value = SORT;
 // 저장된 값이 목록에 없으면 select가 빈칸이 되므로 기본값(최신순)으로 되돌림
 if($('sortsel').selectedIndex < 0) $('sortsel').selectedIndex = 0;
@@ -2182,12 +2378,146 @@ loadHistory();
 </html>
 """
 
+# ---------------------------------------------------------------- 시작 점검 · WSGI
+
+
+def check_config():
+    """설정이 틀리면 조용히 다르게 돌지 말고 시작을 멈춤. 문제 문장 목록 반환."""
+    problems = []
+    raw = (os.environ.get("YT2TEXT_BASE_PATH") or "").rstrip("/")
+    if raw and not BASE_PATH_RE.fullmatch(raw):
+        problems.append("YT2TEXT_BASE_PATH 는 '/apps/ytot' 처럼 /로 시작하는 "
+                        "영문·숫자·._- 경로여야 해요.")
+    raw = os.environ.get("YT2TEXT_SAVE_PATH")
+    if raw and not BASE_PATH_RE.fullmatch(raw):
+        problems.append("YT2TEXT_SAVE_PATH 형식이 틀렸어요 (예: /ytot-save).")
+    if proxy_on() and not _proxy_secret():
+        problems.append(f"{PROXY_SECRET_ENV} 파일을 못 읽었거나 "
+                        f"{PROXY_SECRET_MIN}자보다 짧아요.")
+    return problems
+
+
+def start_background():
+    """비밀번호 로그인(팀 계정)일 때만 팀 기록 만료 청소를 돌림."""
+    if auth_on() and not proxy_on():
+        threading.Thread(target=_prune_loop, daemon=True).start()
+
+
+def wsgi_app():
+    """WSGI 서버용 진입점 — `gunicorn 'yt2text:wsgi_app()'`.
+    작업 상태(JOBS)가 메모리에 있어서 워커는 꼭 1개 (스레드로 동시 처리)."""
+    problems = check_config()
+    if problems:
+        raise SystemExit("설정 오류: " + " / ".join(problems))
+    start_background()
+    return app
+
+
+# ---------------------------------------------------------------- 기록 옮기기 (일회성)
+
+
+def migrate_to_employee(employee_id, apply=False, backup_root=None):
+    """사내망 신뢰 프록시 모드로 옮길 때 한 번 돌리는 명령.
+
+    - 주인(owner) 기록은 어디에도 user 칸이 없고 전문 파일 이름에 접두어도
+      없어서, 기록·폴더에 user="emp:<id>" 를 넣고 전문 파일 이름을 바꿈.
+    - 팀 계정 기록·폴더·전문 파일은 지움 (누가 남긴 건지 몰라서 안 옮김).
+    - 기본은 미리보기 — 아무것도 안 바꾸고 셀 수만 셈. apply=True 면 데이터
+      폴더를 통째로 복사해 둔 뒤 바꿈. 서버를 끈 상태에서 돌려야 해요.
+    """
+    if not EMPLOYEE_ID_RE.fullmatch(str(employee_id)):
+        raise ValueError("직원 id 는 양의 정수예요.")
+    me = f"emp:{employee_id}"
+    counts = dict(history=0, folders=0, files=0, files_missing=0,
+                  team_history=0, team_folders=0, team_files=0, backup=None)
+    with _hist_lock:
+        entries, folders = _load_history(), _load_folders()
+        renames, deletes = [], []
+        for e in entries:
+            who = e.get("user")
+            if who is None:
+                counts["history"] += 1
+                src, dst = _result_path(e["key"]), _result_path(e["key"], me)
+                if src.exists():
+                    renames.append((src, dst))
+                else:
+                    counts["files_missing"] += 1
+            elif who == "team":
+                counts["team_history"] += 1
+                p = _result_path(e["key"], "team")
+                if p.exists():
+                    deletes.append(p)
+        counts["files"] = len(renames)
+        counts["team_files"] = len(deletes)
+        counts["folders"] = sum(1 for f in folders if f.get("user") is None)
+        counts["team_folders"] = sum(1 for f in folders if f.get("user") == "team")
+        if not apply:
+            return counts
+        data_dir = HISTORY_FILE.parent
+        stamp = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        backup = Path(backup_root or data_dir.parent) / f"{data_dir.name}.before-migrate-{stamp}"
+        shutil.copytree(data_dir, backup)
+        counts["backup"] = str(backup)
+        for src, dst in renames:
+            if dst.exists():
+                raise SystemExit(f"이미 있는 파일이라 멈췄어요: {dst} (백업: {backup})")
+            os.replace(src, dst)
+        for p in deletes:
+            p.unlink(missing_ok=True)
+        moved = []
+        for e in entries:
+            if e.get("user") == "team":
+                continue
+            if e.get("user") is None:
+                e["user"] = me
+            moved.append(e)
+        _save_history(moved)
+        kept = []
+        for f in folders:
+            if f.get("user") == "team":
+                continue
+            if f.get("user") is None:
+                f["user"] = me
+            kept.append(f)
+        _save_folders(kept)
+    return counts
+
+
+def _print_migrate(counts, employee_id, apply):
+    head = "옮겼어요" if apply else "미리보기 — 아무것도 안 바꿨어요 (--apply 로 실행)"
+    print(f"[옮기기] 주인 기록 → emp:{employee_id} · {head}")
+    print(f"  기록 {counts['history']}개 · 폴더 {counts['folders']}개 · "
+          f"전문 파일 {counts['files']}개 (파일 없는 기록 {counts['files_missing']}개)")
+    print(f"  팀 기록 지움 {counts['team_history']}개 · 팀 폴더 {counts['team_folders']}개 · "
+          f"팀 전문 파일 {counts['team_files']}개")
+    if counts.get("backup"):
+        print(f"  백업: {counts['backup']}")
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="yt2text — 유튜브 → 텍스트")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--print-csp-hashes", action="store_true",
+                    help="화면 인라인 스크립트·스타일의 CSP 해시를 출력하고 끝")
+    ap.add_argument("--migrate-to-employee", metavar="ID",
+                    help="주인 기록을 사내망 직원 emp:<ID> 로 옮기고 팀 기록을 지움 "
+                         "(기본은 미리보기, 서버를 끄고 실행)")
+    ap.add_argument("--apply", action="store_true",
+                    help="--migrate-to-employee 를 실제로 실행 (데이터 폴더를 먼저 복사)")
     args = ap.parse_args()
+
+    if args.print_csp_hashes:
+        print(json.dumps(inline_hashes(), ensure_ascii=False, indent=2))
+        sys.exit(0)
+    if args.migrate_to_employee:
+        _print_migrate(migrate_to_employee(args.migrate_to_employee, args.apply),
+                       args.migrate_to_employee, args.apply)
+        sys.exit(0)
+    problems = check_config()
+    if problems:
+        sys.exit("설정 오류: " + " / ".join(problems))
 
     if args.host in ("127.0.0.1", "localhost", "::1"):
         ALLOWED_HOSTS = {f"localhost:{args.port}", f"127.0.0.1:{args.port}",
@@ -2197,13 +2527,16 @@ if __name__ == "__main__":
 
     shown = "localhost" if args.host in ("127.0.0.1", "localhost", "::1") else args.host
     print(f"\n  yt2text →  http://{shown}:{args.port}")
-    if auth_on():
+    if proxy_on():
+        print(f"  사내망 신뢰 프록시 모드 · 접두어 {base_path() or '/'} · "
+              "비밀번호 로그인 꺼짐")
+    elif auth_on():
         who = " · ".join(sorted(_users()))
         where = "테일스케일에서만" if tailnet_only() else "LAN 허용"
         print(f"  로그인 켜짐 ({who}) · {where} · 팀 기록은 {TEAM_KEEP_DAYS}일 보관")
-        threading.Thread(target=_prune_loop, daemon=True).start()
     elif args.host not in ("127.0.0.1", "localhost", "::1"):
         print("  (경고) 로그인이 꺼져 있는데 외부에 열려 있어요 — "
               "YT2TEXT_OWNER_PW / YT2TEXT_TEAM_PW를 설정하세요")
     print()
+    start_background()
     app.run(host=args.host, port=args.port, debug=False, threaded=True)

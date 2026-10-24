@@ -177,7 +177,7 @@ class TitleRepairBudget(unittest.TestCase):
                        "fetch_meta", "_fetch_meta_hard")}
         self.hard_calls, self.pauses = [], []
         yt._save_history = lambda entries: None
-        yt._result_path = lambda key: ROOT / "no-such-result.json"
+        yt._result_path = lambda key, user="owner": ROOT / "no-such-result.json"
         yt.fetch_meta = lambda vid: {}          # oembed 실패 (차단 상황)
         self._sleep, yt.time.sleep = yt.time.sleep, self.pauses.append
         yt._title_fix_running = False
