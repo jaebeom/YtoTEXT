@@ -105,14 +105,14 @@ The company intranet (romanty-intranet) checks its own login and forwards reques
 | `YT2TEXT_BASE_PATH` | env var | Path prefix (e.g. `/apps/ytot`). Requests outside it get 404; every path and redirect in the UI carries it |
 | `YT2TEXT_SAVE_PATH` | env var | Intranet page opened by the "save as intranet document" link (default `/ytot-save`, plus `?key=<entry key>`) |
 | `YT2TEXT_KIT_PATH` | env var | Intranet design-kit CSS path (default `/apps/_kit/tool.css`, outside the prefix — served by the intranet) |
-| `?theme=light\|dark` | page query | The intranet frame page passes light/dark on the iframe URL |
+| `?theme=light\|dark\|system` | page query | The intranet frame page passes the initial theme on the iframe URL (`system` follows the OS). Later changes arrive as `postMessage({type:"intranet-theme"})` from the frame |
 | `YT2TEXT_DATA_DIR` | env var | Data folder (default `yt2text_data/` next to the code) |
 
 - The header and variable names deliberately leave out the tool's name — other tools attached to the intranet use the same contract
 - In this mode password login, `/login` and the app's own session cookie are off (those paths return 404), and the 30-day team expiry is disabled — each member owns their records and deletes them themselves
 - A request without the right secret header has no identity and gets 401
 - The result view shows a "사내망 문서로 저장" (save as intranet document) link, only in this mode. It opens outside the frame (`target="_top"`)
-- **Intranet UI mode**: for requests with a valid secret header the page hides its own title bar (the intranet frame draws the title) and loads the intranet design kit plus `intranet.css` to follow the intranet font, colors and radius. Light/dark comes from `?theme=`; at phone widths (360–430px) nothing scrolls sideways, touch devices hide the shortcut hint and get finger-sized card buttons. Inline scripts and styles are unchanged, so the CSP hashes stay the same. Screenshots: `docs/intranet-mode/`
+- **Intranet UI mode**: for requests with a valid secret header the page hides its own title bar (the intranet frame draws the title) and loads the intranet design kit plus `intranet.css` to follow the intranet font, colors and radius. Light/dark/system comes from `?theme=` at first and then from the frame's `postMessage` (same origin, parent window and the three known values only); at phone widths (360–430px) nothing scrolls sideways, touch devices hide the shortcut hint and get finger-sized card buttons. The inline style hash is unchanged; the script hash changes because of the message listener (re-print with `--print-csp-hashes` and update the intranet tool registry). Screenshots: `docs/intranet-mode/`
 - The UI has no inline event attributes (`onclick=` etc.), so the intranet proxy can send a `script-src` with hashes and no `'unsafe-inline'`. Print the hashes with `python yt2text.py --print-csp-hashes` (they don't change with the prefix or other settings)
 - Container: the `Dockerfile` runs `gunicorn 'yt2text:wsgi_app()'` as a non-root user on `127.0.0.1:8765` with one worker and 8 threads (job state lives in memory, so never add workers). Data lives in `/data`; the Whisper model cache goes to a separate `/cache` volume (several GB, kept out of backups)
 

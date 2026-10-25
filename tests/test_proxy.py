@@ -300,7 +300,7 @@ class IntranetMode(Base):
         # 직접 실행(프록시 모드 꺼짐)은 지금 화면 그대로
         os.environ.pop("INTRANET_PROXY_SECRET_FILE")
         html = self.page()
-        self.assertNotIn("data-intranet", html)
+        self.assertIn("<html lang=\"ko\">", html)  # 스크립트에 이름은 있어도 속성은 없음
         self.assertNotIn("intranet.css", html)
         self.assertIn('placeholder="https://www.youtube.com/watch?v=..."', html)
 
@@ -312,6 +312,20 @@ class IntranetMode(Base):
                 html = self.page("/?theme=" + bad, headers=emp(1))
                 self.assertIn('<html lang="ko" data-intranet="1">', html)
                 self.assertNotIn("<script>alert", html)
+
+    def test_theme_message_contract(self):
+        """틀 화면의 postMessage {type:"intranet-theme"} 를 받는 쪽 확인 (사내망 docs/guides/tools.md)"""
+        js = re.search(r"<script>(.*?)</script>", self.page(headers=emp(1)), re.S).group(1)
+        i = js.index("'intranet-theme'")
+        part = js[js.rindex("addEventListener('message'", 0, i):js.index("});", i)]
+        for need in ("hasAttribute('data-intranet')", "ev.origin !== location.origin",
+                     "ev.source !== window.parent", "['light','dark','system'].includes(theme)",
+                     "delete document.documentElement.dataset.theme"):
+            with self.subTest(need=need):
+                self.assertIn(need, js if need.startswith("has") else part)
+        # 「시스템」(속성 없음)은 키트처럼 시스템 설정을 따름
+        css = self.c.get("/intranet.css", headers=emp(1)).get_data(as_text=True)
+        self.assertIn('@media (prefers-color-scheme: dark){\n  :root[data-intranet]:not([data-theme="light"]){', css)
 
     def test_paths_follow_prefix_and_kit_setting(self):
         os.environ["YT2TEXT_BASE_PATH"] = "/apps/ytot"

@@ -1350,7 +1350,7 @@ document.getElementById('loginform').addEventListener('submit', go);
 """
 
 # 사내망 모드 덧씌우기 (T-52). 색·글꼴은 사내망 디자인 키트의 토큰(사내망 globals.css 와 같은 이름)을 쓰고,
-# 키트가 아직 없거나 못 불러도 같은 값으로 보이게 기본값을 둠. 어둡게는 :root[data-theme="dark"] — 사내망과 같은 방식.
+# 키트가 아직 없거나 못 불러도 같은 값으로 보이게 기본값을 둠. 어둡게는 :root[data-theme="dark"], 속성이 없으면 시스템 설정 — 사내망 키트와 같은 방식.
 INTRANET_CSS = r""":root[data-intranet]{
   color-scheme: light;
   --bg: var(--background, oklch(0.985 0.002 260));
@@ -1382,6 +1382,24 @@ INTRANET_CSS = r""":root[data-intranet]{
   --line: var(--border, oklch(0.31 0.012 265));
   --chip: var(--muted, oklch(0.25 0.012 265));
   --accent: var(--primary, oklch(0.7 0.15 262));
+}
+/* 화면 모드 「시스템」(data-theme 없음)은 시스템 설정을 따름 — 키트와 같은 방식 */
+@media (prefers-color-scheme: dark){
+  :root[data-intranet]:not([data-theme="light"]){
+    color-scheme: dark;
+    --bg: var(--background, oklch(0.17 0.01 265));
+    --panel: var(--card, oklch(0.21 0.012 265));
+    --panel-hi: var(--muted, oklch(0.25 0.012 265));
+    --fg: var(--foreground, oklch(0.95 0.005 260));
+    --fg-mid: var(--foreground, oklch(0.95 0.005 260));
+    --fg-soft: var(--muted-foreground, oklch(0.74 0.015 260));
+    --sheet: var(--card, oklch(0.21 0.012 265));
+    --ink: var(--card-foreground, oklch(0.95 0.005 260));
+    --ink-soft: var(--muted-foreground, oklch(0.74 0.015 260));
+    --line: var(--border, oklch(0.31 0.012 265));
+    --chip: var(--muted, oklch(0.25 0.012 265));
+    --accent: var(--primary, oklch(0.7 0.15 262));
+  }
 }
 /* 틀 페이지가 제목을 그리므로 자기 제목줄은 숨김. iframe 안이라 바깥 여백을 줄임 */
 :root[data-intranet] .brand{display:none}
@@ -2496,6 +2514,17 @@ $('sortsel').value = SORT;
 // 저장된 값이 목록에 없으면 select가 빈칸이 되므로 기본값(최신순)으로 되돌림
 if($('sortsel').selectedIndex < 0) $('sortsel').selectedIndex = 0;
 SORT = $('sortsel').value;
+// 사내망 틀 화면이 보내는 화면 모드 (사내망 docs/guides/tools.md 「화면 모드」) — 사내망 모드에서만.
+// 처음 값은 서버가 iframe 주소 ?theme= 로 <html data-theme> 에 넣고, 바뀔 때만 이 메시지로 받음
+if(document.documentElement.hasAttribute('data-intranet')){
+  window.addEventListener('message', ev=>{
+    if(ev.origin !== location.origin || ev.source !== window.parent) return;
+    const {type, theme} = ev.data || {};
+    if(type !== 'intranet-theme' || !['light','dark','system'].includes(theme)) return;
+    if(theme === 'system') delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = theme;
+  });
+}
 setMode(getMode());
 loadMe();
 loadHistory();
