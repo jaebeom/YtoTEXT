@@ -209,6 +209,20 @@ def save_path():
     return p if BASE_PATH_RE.fullmatch(p) else SAVE_PATH_DEFAULT
 
 
+KIT_PATH_DEFAULT = "/apps/_kit/tool.css"   # 사내망 디자인 키트 (접두어 밖, 사내망이 줌 — 사내망 T-51)
+
+
+def kit_path():
+    p = os.environ.get("YT2TEXT_KIT_PATH") or KIT_PATH_DEFAULT
+    return p if BASE_PATH_RE.fullmatch(p) else KIT_PATH_DEFAULT
+
+
+def intranet_mode():
+    """사내망 모드 (사내망 결정 26, T-52): 신뢰 프록시 헤더가 맞는 요청일 때만.
+    직접 실행(개발·혼자 쓰기)은 지금 화면 그대로."""
+    return proxy_on() and _proxy_user() is not None
+
+
 class _BasePath:
     """접두어 아래로 온 요청만 받아서 접두어를 SCRIPT_NAME 으로 옮김.
     접두어 밖 요청은 404 — 사내망 프록시가 넘겨준 경로만 앱에 닿게."""
@@ -1230,15 +1244,35 @@ def api_stt_cancel():
 
 def _page(html):
     """화면 HTML 에 경로 접두어·배치 상한을 meta 로 넣음. 스크립트 본문에는 값을
-    안 넣어서 인라인 스크립트 해시가 설정과 상관없이 늘 같음 (사내망 CSP 용)."""
-    return (html.replace("__BASE_PATH__", base_path())
-                .replace("__BATCH_MAX__", str(BATCH_MAX))
-                .replace("__PROXY_SAVE__", save_path() if proxy_on() else ""))
+    안 넣어서 인라인 스크립트 해시가 설정과 상관없이 늘 같음 (사내망 CSP 용).
+
+    사내망 모드에서는 인라인 <script>·<style> 은 그대로 두고 마크업만 바꿈 — CSP 해시가 안 바뀜:
+      - <html data-intranet="1" data-theme="light|dark"> (테마는 틀 페이지가 iframe 주소 ?theme= 로 줌)
+      - 인라인 <style> 뒤에 사내망 디자인 키트와 intranet.css (제목줄 숨김·사내망 색·휴대폰 폭)
+      - 입력칸 안내를 짧게 (휴대폰에서 잘리지 않게)"""
+    out = (html.replace("__BASE_PATH__", base_path())
+               .replace("__BATCH_MAX__", str(BATCH_MAX))
+               .replace("__PROXY_SAVE__", save_path() if proxy_on() else ""))
+    if not intranet_mode():
+        return out
+    theme = request.args.get("theme")
+    attrs = ' data-intranet="1"' + (f' data-theme="{theme}"' if theme in ("light", "dark") else "")
+    links = (f'<link rel="stylesheet" href="{kit_path()}">\n'
+             f'<link rel="stylesheet" href="{base_path()}/intranet.css">\n')
+    return (out.replace('<html lang="ko">', f'<html lang="ko"{attrs}>', 1)
+               .replace("</head>", links + "</head>", 1)
+               .replace('placeholder="https://www.youtube.com/watch?v=..."', 'placeholder="유튜브 주소"', 1))
 
 
 @app.get("/")
 def index():
     return Response(_page(PAGE), mimetype="text/html")
+
+
+@app.get("/intranet.css")
+def intranet_css():
+    """사내망 모드 화면의 덧씌우기 CSS (같은 출처 파일 — 사내망 CSP style-src 'self')."""
+    return Response(INTRANET_CSS, mimetype="text/css", headers={"Cache-Control": "no-cache"})
 
 
 def inline_hashes():
@@ -1313,6 +1347,90 @@ document.getElementById('loginform').addEventListener('submit', go);
 </script>
 </body>
 </html>
+"""
+
+# 사내망 모드 덧씌우기 (T-52). 색·글꼴은 사내망 디자인 키트의 토큰(사내망 globals.css 와 같은 이름)을 쓰고,
+# 키트가 아직 없거나 못 불러도 같은 값으로 보이게 기본값을 둠. 어둡게는 :root[data-theme="dark"] — 사내망과 같은 방식.
+INTRANET_CSS = r""":root[data-intranet]{
+  color-scheme: light;
+  --bg: var(--background, oklch(0.985 0.002 260));
+  --panel: var(--card, oklch(1 0 0));
+  --panel-hi: var(--muted, oklch(0.955 0.006 260));
+  --fg: var(--foreground, oklch(0.21 0.02 265));
+  --fg-mid: var(--foreground, oklch(0.21 0.02 265));
+  --fg-soft: var(--muted-foreground, oklch(0.47 0.02 265));
+  --sheet: var(--card, oklch(1 0 0));
+  --ink: var(--card-foreground, oklch(0.21 0.02 265));
+  --ink-soft: var(--muted-foreground, oklch(0.47 0.02 265));
+  --line: var(--border, oklch(0.9 0.008 260));
+  --chip: var(--muted, oklch(0.955 0.006 260));
+  --accent: var(--primary, oklch(0.49 0.2 262));
+  --sans: var(--font-sans, 'Pretendard', -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif);
+  --r: var(--radius, 0.625rem);
+}
+:root[data-intranet][data-theme="dark"]{
+  color-scheme: dark;
+  --bg: var(--background, oklch(0.17 0.01 265));
+  --panel: var(--card, oklch(0.21 0.012 265));
+  --panel-hi: var(--muted, oklch(0.25 0.012 265));
+  --fg: var(--foreground, oklch(0.95 0.005 260));
+  --fg-mid: var(--foreground, oklch(0.95 0.005 260));
+  --fg-soft: var(--muted-foreground, oklch(0.74 0.015 260));
+  --sheet: var(--card, oklch(0.21 0.012 265));
+  --ink: var(--card-foreground, oklch(0.95 0.005 260));
+  --ink-soft: var(--muted-foreground, oklch(0.74 0.015 260));
+  --line: var(--border, oklch(0.31 0.012 265));
+  --chip: var(--muted, oklch(0.25 0.012 265));
+  --accent: var(--primary, oklch(0.7 0.15 262));
+}
+/* 틀 페이지가 제목을 그리므로 자기 제목줄은 숨김. iframe 안이라 바깥 여백을 줄임 */
+:root[data-intranet] .brand{display:none}
+:root[data-intranet] body{padding:16px 16px 48px;min-height:0}
+:root[data-intranet] .col{max-width:960px}
+:root[data-intranet] .mode{margin-top:0}
+/* 모서리·입력칸·단추를 사내망 부품처럼 */
+:root[data-intranet] .mode,
+:root[data-intranet] .inbar textarea,
+:root[data-intranet] .btn,
+:root[data-intranet] .wopts select,
+:root[data-intranet] .sheet,
+:root[data-intranet] .card{border-radius:var(--r)}
+:root[data-intranet] .inbar textarea,
+:root[data-intranet] .wopts select{border:1px solid var(--line);font-family:var(--sans)}
+:root[data-intranet] .inbar textarea::placeholder{color:var(--fg-soft)}
+:root[data-intranet] .btn:hover{filter:brightness(.92);background:var(--accent)}
+:root[data-intranet] .mode button.on,
+:root[data-intranet] .btn{color:var(--primary-foreground, #fff)}
+:root[data-intranet] .hint,
+:root[data-intranet] .logout{color:var(--fg-soft)}
+:root[data-intranet] .sheet,
+:root[data-intranet] .card{border:1px solid var(--line)}
+/* 원래 화면의 어두운 고정색(#20242B·#181B20)을 사내망 토큰으로 — 밝게에서 검은 알약·검은 칸이 되지 않게 */
+:root[data-intranet] .card .src,
+:root[data-intranet] .qbtn,
+:root[data-intranet] .qbar{background:var(--chip)}
+:root[data-intranet] .qbtn:hover{background:var(--panel-hi)}
+:root[data-intranet] .card img,
+:root[data-intranet] .qrow img{background:var(--chip)}
+:root[data-intranet] .card .src.w{color:var(--accent)}
+:root[data-intranet] .card .acts button{background:var(--panel);color:var(--fg);border:1px solid var(--line)}
+:root[data-intranet] .err{color:var(--destructive, oklch(0.55 0.2 27))}
+/* 휴대폰(360~430px): 입력칸이 넘치지 않게, 터치 기기에는 단축키 안내를 숨기고, 카드 단추는 손가락 크기로 */
+@media (max-width:480px){
+  :root[data-intranet] body{padding:12px 12px 40px}
+  :root[data-intranet] .inbar{gap:8px}
+  :root[data-intranet] .inbar textarea{padding:12px;font-size:16px}
+  :root[data-intranet] .btn{padding:12px 16px}
+  :root[data-intranet] .mode{display:flex}
+  :root[data-intranet] .mode button{flex:1;padding:10px 8px}
+}
+@media (hover:none){
+  :root[data-intranet] .hint .kbd{display:none}
+}
+@media (pointer:coarse){
+  :root[data-intranet] .card .acts{gap:6px}
+  :root[data-intranet] .card .acts button{width:40px;height:40px;font-size:16px}
+}
 """
 
 PAGE = r"""<!doctype html>
@@ -1532,7 +1650,7 @@ PAGE = r"""<!doctype html>
         autofocus></textarea>
       <button class="btn" id="gobtn">추출</button>
     </div>
-    <div class="hint">여러 개는 줄바꿈으로 구분 (최대 __BATCH_MAX__개) · ⌘/Ctrl+Enter로 추출</div>
+    <div class="hint">여러 개는 줄바꿈으로 구분 (최대 __BATCH_MAX__개)<span class="kbd"> · ⌘/Ctrl+Enter로 추출</span></div>
 
     <div class="wopts" id="wopts">
       <select id="model">
@@ -1560,7 +1678,7 @@ PAGE = r"""<!doctype html>
       <div class="tools">
         <label><input type="checkbox" id="tsbox"> 타임스탬프</label>
         <div class="sp"></div>
-        <a class="tbtn" id="savebtn" hidden
+        <a class="tbtn" id="savebtn" target="_top" hidden
           title="이 결과를 사내망 문서로 저장하는 화면을 열어요">사내망 문서로 저장</a>
         <button class="tbtn" id="copybtn" data-label="복사">복사</button>
         <button class="tbtn" id="aicopybtn" data-label="AI용 복사"
