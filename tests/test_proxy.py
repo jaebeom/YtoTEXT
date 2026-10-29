@@ -34,7 +34,7 @@ yt = _load()
 SECRET = "s" * 40                 # 가짜 비밀값 (테스트 전용)
 VID, VID2 = "dQw4w9WgXcQ", "aaaaaaaaaaa"
 ENV_KEYS = ("INTRANET_PROXY_SECRET_FILE", "YT2TEXT_BASE_PATH", "YT2TEXT_SAVE_PATH",
-            "YT2TEXT_OWNER_PW", "YT2TEXT_TEAM_PW", "YT2TEXT_ALLOW_LAN")
+            "YT2TEXT_OWNER_PW", "YT2TEXT_TEAM_PW", "YT2TEXT_ALLOW_LAN", "YT2TEXT_KIT_PATH")
 
 
 def emp(i, secret=SECRET):
@@ -282,6 +282,74 @@ class ThumbsAndBootstrap(Base):
         self.assertIn('<meta name="ytot-proxy-save" content="">', html)
 
 
+
+class IntranetMode(Base):
+    """사내망 모드 화면 (사내망 결정 26, T-52) — 신뢰 프록시 헤더가 맞을 때만"""
+
+    def page(self, path="/", **kw):
+        return self.c.get(path, **kw).get_data(as_text=True)
+
+    def test_on_only_with_trusted_proxy_headers(self):
+        html = self.page(headers=emp(1))
+        self.assertIn('<html lang="ko" data-intranet="1">', html)
+        self.assertIn('<link rel="stylesheet" href="/apps/_kit/tool.css">', html)
+        self.assertIn('<link rel="stylesheet" href="/intranet.css">', html)
+        self.assertIn('placeholder="유튜브 주소"', html)
+        # 키트·덧씌우기는 인라인 <style> 뒤 — 같은 이름 규칙을 이김
+        self.assertLess(html.index("</style>"), html.index("/intranet.css"))
+        # 직접 실행(프록시 모드 꺼짐)은 지금 화면 그대로
+        os.environ.pop("INTRANET_PROXY_SECRET_FILE")
+        html = self.page()
+        self.assertIn("<html lang=\"ko\">", html)  # 스크립트에 이름은 있어도 속성은 없음
+        self.assertNotIn("intranet.css", html)
+        self.assertIn('placeholder="https://www.youtube.com/watch?v=..."', html)
+
+    def test_theme_from_frame_query_only_light_or_dark(self):
+        self.assertIn('data-intranet="1" data-theme="dark">', self.page("/?theme=dark", headers=emp(1)))
+        self.assertIn('data-intranet="1" data-theme="light">', self.page("/?theme=light", headers=emp(1)))
+        for bad in ("blue", '"><script>', ""):
+            with self.subTest(theme=bad):
+                html = self.page("/?theme=" + bad, headers=emp(1))
+                self.assertIn('<html lang="ko" data-intranet="1">', html)
+                self.assertNotIn("<script>alert", html)
+
+    def test_theme_message_contract(self):
+        """틀 화면의 postMessage {type:"intranet-theme"} 를 받는 쪽 확인 (사내망 docs/guides/tools.md)"""
+        js = re.search(r"<script>(.*?)</script>", self.page(headers=emp(1)), re.S).group(1)
+        i = js.index("'intranet-theme'")
+        part = js[js.rindex("addEventListener('message'", 0, i):js.index("});", i)]
+        for need in ("hasAttribute('data-intranet')", "ev.origin !== location.origin",
+                     "ev.source !== window.parent", "['light','dark','system'].includes(theme)",
+                     "delete document.documentElement.dataset.theme"):
+            with self.subTest(need=need):
+                self.assertIn(need, js if need.startswith("has") else part)
+        # 「시스템」(속성 없음)은 키트처럼 시스템 설정을 따름
+        css = self.c.get("/intranet.css", headers=emp(1)).get_data(as_text=True)
+        self.assertIn('@media (prefers-color-scheme: dark){\n  :root[data-intranet]:not([data-theme="light"]){', css)
+
+    def test_paths_follow_prefix_and_kit_setting(self):
+        os.environ["YT2TEXT_BASE_PATH"] = "/apps/ytot"
+        os.environ["YT2TEXT_KIT_PATH"] = "/apps/_kit/v2.css"
+        html = self.page("/apps/ytot/", headers=emp(1))
+        self.assertIn('href="/apps/_kit/v2.css"', html)
+        self.assertIn('href="/apps/ytot/intranet.css"', html)
+        os.environ["YT2TEXT_KIT_PATH"] = "//evil.example.test/x.css"   # 형식이 틀리면 기본 경로
+        self.assertIn('href="/apps/_kit/tool.css"', self.page("/apps/ytot/", headers=emp(1)))
+
+    def test_intranet_css_is_served_and_hides_title_bar(self):
+        r = self.c.get("/intranet.css", headers=emp(1))
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.mimetype == "text/css")
+        css = r.get_data(as_text=True)
+        self.assertIn(":root[data-intranet] .brand{display:none}", css)
+        self.assertIn(':root[data-intranet][data-theme="dark"]', css)
+        self.assertIn("@media (hover:none)", css)    # 터치 기기엔 단축키 안내 숨김
+        self.assertIn("@media (pointer:coarse)", css)  # 카드 단추는 손가락 크기
+
+    def test_kbd_hint_is_a_separate_span(self):
+        self.assertIn('<span class="kbd"> · ⌘/Ctrl+Enter로 추출</span>', yt.PAGE)
+
+
 class SsrfAndModels(Base):
     def test_only_canonical_watch_url_reaches_worker(self):
         for raw in (f"http://10.0.0.5/?x=youtu.be/{VID}",
@@ -413,7 +481,7 @@ class CspReady(Base):
                 self.assertEqual(got, want["PAGE"][tag], (base, tag))
 
     def test_save_link_only_in_proxy_mode(self):
-        self.assertIn('id="savebtn" hidden', yt.PAGE)
+        self.assertIn('id="savebtn" target="_top" hidden', yt.PAGE)  # 사내망 화면으로 가는 링크는 틀 밖(최상위)으로
         self.assertIn("save.hidden = !PROXY", yt.PAGE)
         os.environ["YT2TEXT_SAVE_PATH"] = "/docs/ytot-save"
         self.assertEqual(self.c.get("/api/me", headers=emp(3)).get_json()["save_path"],
