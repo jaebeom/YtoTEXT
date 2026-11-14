@@ -1404,7 +1404,13 @@ INTRANET_CSS = r""":root[data-intranet]{
 /* 틀 페이지가 제목을 그리므로 자기 제목줄은 숨김. iframe 안이라 바깥 여백을 줄임 */
 :root[data-intranet] .brand{display:none}
 :root[data-intranet] body{padding:16px 16px 48px;min-height:0}
-:root[data-intranet] .col{max-width:960px}
+:root[data-intranet] .col,
+:root[data-intranet] .histsec{max-width:none}  /* 틀 폭을 다 써요 — 넓은 화면에서 가운데 좁은 칸만 남지 않게 (사내망 T-84) */
+/* 폴더 목록은 카드 위 한 줄 칩으로 — 사내망 사이드바 옆에 사이드바가 하나 더 서 보이지 않게 */
+:root[data-intranet] .histwrap{flex-direction:column;gap:12px;align-items:stretch}
+:root[data-intranet] .folders{width:100%;position:static;display:flex;flex-wrap:wrap;gap:6px}
+:root[data-intranet] .fsep{display:none}
+:root[data-intranet] .fadd{width:auto;margin-top:0;white-space:nowrap}
 :root[data-intranet] .mode{margin-top:0}
 /* 모서리·입력칸·단추를 사내망 부품처럼 */
 :root[data-intranet] .mode,
@@ -1434,6 +1440,9 @@ INTRANET_CSS = r""":root[data-intranet]{
 :root[data-intranet] .card .acts button{background:var(--panel);color:var(--fg);border:1px solid var(--line)}
 :root[data-intranet] .err{color:var(--destructive, oklch(0.55 0.2 27))}
 /* 휴대폰(360~430px): 입력칸이 넘치지 않게, 터치 기기에는 단축키 안내를 숨기고, 카드 단추는 손가락 크기로 */
+@media (max-width:820px){
+  :root[data-intranet] .folders{flex-wrap:nowrap}  /* 휴대폰은 지금처럼 옆으로 미는 한 줄 */
+}
 @media (max-width:480px){
   :root[data-intranet] body{padding:12px 12px 40px}
   :root[data-intranet] .inbar{gap:8px}

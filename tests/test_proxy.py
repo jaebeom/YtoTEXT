@@ -345,6 +345,11 @@ class IntranetMode(Base):
         self.assertIn(':root[data-intranet][data-theme="dark"]', css)
         self.assertIn("@media (hover:none)", css)    # 터치 기기엔 단축키 안내 숨김
         self.assertIn("@media (pointer:coarse)", css)  # 카드 단추는 손가락 크기
+        # 틀 폭을 다 쓰고, 폴더 목록은 카드 위 칩 줄 — 사내망 사이드바 옆에 사이드바가 하나 더 서지 않게 (사내망 T-84)
+        self.assertIn(":root[data-intranet] .histsec{max-width:none}", css)
+        self.assertNotIn("max-width:960px", css)
+        self.assertIn(":root[data-intranet] .histwrap{flex-direction:column;", css)
+        self.assertIn(":root[data-intranet] .folders{width:100%;position:static;display:flex;flex-wrap:wrap;", css)
 
     def test_kbd_hint_is_a_separate_span(self):
         self.assertIn('<span class="kbd"> · ⌘/Ctrl+Enter로 추출</span>', yt.PAGE)
